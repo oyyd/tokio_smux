@@ -74,6 +74,16 @@ impl Frame {
     }
   }
 
+  pub fn new_v1(cmd: Cmd, sid: u32) -> Self {
+    Self {
+      ver: 1,
+      cmd,
+      sid,
+      length: 0,
+      data: None,
+    }
+  }
+
   pub fn with_data(&mut self, data: Vec<u8>) {
     self.length = data.len() as u16;
     self.data = Some(data)

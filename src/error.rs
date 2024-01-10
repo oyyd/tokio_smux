@@ -19,12 +19,17 @@ pub enum TokioSmuxError {
   #[error("stream id overflows, should start a new connection")]
   SessionGoAway,
 
+  #[error("stream closed")]
+  StreamClosed,
+
+  #[error("stream receives unexpected cmd: {cmd_value}")]
+  StreamReceiveUnexpectedCmd { cmd_value: u8 },
+
   #[error("tokio recv error: {inner}")]
   TokioRecvError { inner: String },
 
   #[error("tokio send error: {inner}")]
   TokioSendError { inner: String },
-
 
   #[error("{msg}")]
   Default { msg: String },

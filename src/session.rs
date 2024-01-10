@@ -1,45 +1,20 @@
 use crate::config::SmuxConfig;
 use crate::error::{Result, TokioSmuxError};
-use crate::frame::{self, HEADER_SIZE};
+use crate::frame::HEADER_SIZE;
+use crate::stream::Stream;
 use crate::{Cmd, Frame};
 use dashmap::DashMap;
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::RwLock;
-use tokio::sync::{broadcast, mpsc, oneshot, Mutex};
-
-// TODO implement Stream apis
-pub struct Stream {
-  sid: u32,
-}
-
-impl Drop for Stream {
-  fn drop(&mut self) {
-    // TODO should inform Session something?
-  }
-}
-
-// TODO implement some tokio async read/write traits?
-impl Stream {
-  pub fn new(sid: u32) -> Self {
-    Self { sid }
-  }
-
-  pub async fn write(&self) {
-    //
-  }
-
-  pub async fn read(&self) {
-    //
-  }
-}
+use tokio::sync::{broadcast, mpsc, oneshot};
 
 const MAX_STREAMS: usize = 65535;
 const MAX_WRITE_REQ: usize = 1024;
 
-struct WriteRequest {
-  frame: Frame,
-  finish_tx: oneshot::Sender<()>,
+pub(crate) struct WriteRequest {
+  pub frame: Frame,
+  pub finish_tx: Option<oneshot::Sender<()>>,
 }
 
 struct ReadRequest {
@@ -127,7 +102,12 @@ impl<T: AsyncRead + AsyncWrite + Send + Unpin + 'static> SessionInner<T> {
     // TODO is using write() different?
     self.conn.write_all(&data).await?;
 
-    let finish_res: std::prelude::v1::Result<(), ()> = req.finish_tx.send(());
+    if req.finish_tx.is_none() {
+      return Ok(());
+    }
+
+    let finish_tx = req.finish_tx.unwrap();
+    let finish_res: std::prelude::v1::Result<(), ()> = finish_tx.send(());
     if finish_res.is_err() {
       return Err(TokioSmuxError::Default {
         msg: "failed to finish_tx.send()".to_string(),
@@ -257,16 +237,12 @@ impl FrameSpliter {
   }
 }
 
-// TODO
-struct StreamController {}
-
 pub struct Session {
   config: SmuxConfig,
 
   // current stream id
   sid: u32,
-  streams_controllers: DashMap<u32, Arc<RwLock<StreamController>>>,
-
+  // streams_controllers: DashMap<u32, Arc<RwLock<StreamController>>>,
   closed_tx: broadcast::Sender<()>,
   closed_rx: broadcast::Receiver<()>,
   closed: bool,
@@ -279,6 +255,7 @@ pub struct Session {
   sid_frames_rx_map: Arc<DashMap<u32, mpsc::Receiver<Frame>>>,
 }
 
+// TODO impl drop for cleaning
 impl Session {
   pub fn new<T: AsyncRead + AsyncWrite + Send + Unpin + 'static>(
     conn: T,
@@ -319,7 +296,7 @@ impl Session {
         true => 1,
         false => 0,
       },
-      streams_controllers: DashMap::new(),
+      // streams_controllers: DashMap::new(),
       closed_tx,
       closed_rx,
       closed: false,
@@ -387,18 +364,23 @@ impl Session {
   // 1. New a stream.
   // 2. Create stream controller and push it.
   fn new_stream(&mut self, sid: u32) -> Stream {
-    let stream = Stream::new(sid);
     // TODO
-    let controller = Arc::new(RwLock::new(StreamController {}));
-    self.streams_controllers.insert(sid, controller);
+    let (frame_tx, frame_rx) = mpsc::channel(1024);
+    let (write_tx, write_rx) = mpsc::channel(1024);
+    let (close_tx, close_rx) = oneshot::channel();
+    let stream = Stream::new(sid, frame_rx, write_tx, close_rx);
+    // TODO
+    // let controller = StreamController {};
+    // let controller = Arc::new(RwLock::new(controller));
+    // self.streams_controllers.insert(sid, controller);
 
     stream
   }
 
   fn remove_stream_controller(&mut self, sid: u32) {
-    if self.streams_controllers.contains_key(&sid) {
-      self.streams_controllers.remove(&sid);
-    }
+    // if self.streams_controllers.contains_key(&sid) {
+    //   self.streams_controllers.remove(&sid);
+    // }
   }
 
   async fn write_frame(&mut self, frame: Frame) -> Result<()> {
@@ -409,7 +391,7 @@ impl Session {
       .write_tx
       .send(WriteRequest {
         frame,
-        finish_tx: tx,
+        finish_tx: Some(tx),
       })
       .await?;
 
@@ -421,7 +403,7 @@ impl Session {
 #[cfg(test)]
 mod test {
   use crate::{session::Session, SmuxConfig};
-  use tokio::io::{AsyncRead, AsyncWrite};
+  use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 
   struct MockAsyncStream {}
 
@@ -477,6 +459,7 @@ mod test {
     // let stream = tokio::net::TcpStream::connect("127.0.0.1:1234")
     //   .await
     //   .unwrap();
+
     let session = Session::new(stream, SmuxConfig::default(), true);
   }
 }
