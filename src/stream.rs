@@ -1,6 +1,6 @@
 use crate::error::{Result, TokioSmuxError};
 use crate::frame::{Cmd, Frame};
-use crate::session::WriteRequest;
+use crate::session_inner::WriteRequest;
 use tokio::sync::{mpsc, oneshot};
 
 // Three possible closing scenarioes:
@@ -10,7 +10,6 @@ use tokio::sync::{mpsc, oneshot};
 pub struct Stream {
   sid: u32,
 
-  // frame_rx gets closed means the session is closed.
   frame_rx: mpsc::Receiver<Frame>,
   write_tx: Option<mpsc::Sender<WriteRequest>>,
   // Disallow write operations after receiving from close_rx.
@@ -42,7 +41,7 @@ impl Drop for Stream {
 
 impl Stream {
   // Let session pass these parameters therefore we could control channel capabilities from outside.
-  pub fn new(
+  pub(crate) fn new(
     sid: u32,
     frame_rx: mpsc::Receiver<Frame>,
     write_tx: mpsc::Sender<WriteRequest>,

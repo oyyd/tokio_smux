@@ -1,176 +1,15 @@
 use crate::config::SmuxConfig;
 use crate::error::{Result, TokioSmuxError};
-use crate::frame::HEADER_SIZE;
+use crate::session_inner::{ReadRequest, SessionInner, WriteRequest};
 use crate::stream::Stream;
 use crate::{Cmd, Frame};
 use dashmap::DashMap;
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::sync::RwLock;
 use tokio::sync::{broadcast, mpsc, oneshot};
 
 const MAX_STREAMS: usize = 65535;
 const MAX_WRITE_REQ: usize = 1024;
-
-pub(crate) struct WriteRequest {
-  pub frame: Frame,
-  pub finish_tx: Option<oneshot::Sender<()>>,
-}
-
-struct ReadRequest {
-  frame: Frame,
-}
-
-// Hold the connection and handle low-level operations, like frames reading/writing.
-struct SessionInner<T: AsyncRead + AsyncWrite + Send + Unpin + 'static> {
-  conn: T,
-
-  // Receive write requests and handle writing.
-  write_rx: mpsc::Receiver<WriteRequest>,
-
-  // Receive close request and stop the connection.
-  closed_rx: broadcast::Receiver<()>,
-
-  // Send new frames to outside.
-  recv_tx: mpsc::Sender<ReadRequest>,
-
-  read_buf: Vec<u8>,
-}
-
-impl<T: AsyncRead + AsyncWrite + Send + Unpin + 'static> SessionInner<T> {
-  pub fn new(
-    conn: T,
-    write_rx: mpsc::Receiver<WriteRequest>,
-    closed_rx: broadcast::Receiver<()>,
-  ) -> (Self, mpsc::Receiver<ReadRequest>) {
-    // TODO
-    let buffer: usize = 1024;
-    let (recv_tx, recv_rx) = mpsc::channel(buffer);
-
-    let inner = Self {
-      conn,
-      write_rx,
-      closed_rx,
-      recv_tx,
-      read_buf: vec![],
-    };
-
-    (inner, recv_rx)
-  }
-
-  pub async fn run(&mut self) {
-    // TODO add way to tell session the connection is broken
-    self.run_inner().await.unwrap();
-  }
-
-  // TODO add keep-alive looping
-  // Should return Err only when the error is not recoverable.
-  async fn run_inner(&mut self) -> Result<()> {
-    let mut data: Vec<u8> = vec![0; 65535];
-
-    // NOTE: Always ensure the cancel safety.
-    // TODO hot path, is using select! correctly here?
-    loop {
-      tokio::select! {
-        req = self.write_rx.recv() => {
-          if req.is_none() {
-            // Write_rx is closed, means the session is removed.
-            break;
-          }
-          self.handle_write_req(req.unwrap()).await?;
-        }
-        size = self.conn.read(&mut data) => {
-          if size.is_err() {
-            return Err(TokioSmuxError::Default { msg: format!("read data failed") })
-          }
-          let size = size.unwrap();
-          self.handle_read_data(&data[0..size])?;
-        }
-        _ = self.closed_rx.recv() => {
-          self.handle_before_stop()?;
-          break; // don't loop anymore when closed
-        }
-      }
-    }
-
-    Ok(())
-  }
-
-  async fn handle_write_req(&mut self, req: WriteRequest) -> Result<()> {
-    let data = req.frame.get_buf()?;
-
-    // TODO is using write() different?
-    self.conn.write_all(&data).await?;
-
-    if req.finish_tx.is_none() {
-      return Ok(());
-    }
-
-    let finish_tx = req.finish_tx.unwrap();
-    let finish_res: std::prelude::v1::Result<(), ()> = finish_tx.send(());
-    if finish_res.is_err() {
-      return Err(TokioSmuxError::Default {
-        msg: "failed to finish_tx.send()".to_string(),
-      });
-    }
-
-    Ok(())
-  }
-
-  fn handle_before_stop(&mut self) -> Result<()> {
-    Ok(())
-  }
-
-  fn handle_read_data(&mut self, data: &[u8]) -> Result<()> {
-    if data.len() == 0 {
-      // Remote write side closed, no more data.
-      return Ok(());
-    }
-    // REFACTOR: refactor allocation
-    self.read_buf.append(&mut data.to_vec());
-
-    // REFACTOR: or use cursor to refactor
-    loop {
-      if self.read_buf.len() < HEADER_SIZE {
-        break;
-      }
-
-      let frame = Frame::from_buf(&self.read_buf[0..HEADER_SIZE])?;
-      // Not enough header data. Though we have ensured the data size is enough.
-      if frame.is_none() {
-        break;
-      }
-      let mut frame = frame.unwrap();
-      let frame_length = frame.length;
-      // check if all data ready
-      if (frame_length + HEADER_SIZE as u16) > (self.read_buf.len() as u16) {
-        // not enough data
-        break;
-      }
-
-      // pop data
-      let mut frame_data: Vec<u8> = vec![0; frame_length as usize];
-      frame_data
-        .clone_from_slice(&self.read_buf[HEADER_SIZE..HEADER_SIZE + (frame_length as usize)]);
-      self.read_buf = self.read_buf[HEADER_SIZE + (frame_length as usize)..].to_vec();
-      frame.with_data(frame_data);
-      let read_req = ReadRequest { frame };
-
-      // output frame
-      // TODO consider should we block here
-      let recv_tx = self.recv_tx.clone();
-      tokio::spawn(async move {
-        // TODO when will errors happen?
-        // Will block if the tx capability is empty.
-        recv_tx.send(read_req).await.unwrap();
-      });
-
-      // continue
-    }
-
-    Ok(())
-  }
-}
 
 // Consume reading frames and split them into:
 // - Sync frames
@@ -401,18 +240,48 @@ impl Session {
 }
 
 #[cfg(test)]
-mod test {
+pub mod test {
   use crate::{session::Session, SmuxConfig};
   use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 
-  struct MockAsyncStream {}
+  pub struct MockAsyncStream {
+    pub read_data: Vec<u8>,
+    pub write_data: Vec<u8>,
+  }
+
+  impl MockAsyncStream {
+    pub fn new() -> Self {
+      MockAsyncStream {
+        read_data: vec![],
+        write_data: vec![],
+      }
+    }
+
+    pub fn with_read_data(&mut self, data: Vec<u8>) {
+      self.read_data = data;
+    }
+
+    pub fn with_write_data(&mut self, data: Vec<u8>) {
+      self.write_data = data;
+    }
+  }
 
   impl AsyncRead for MockAsyncStream {
     fn poll_read(
-      self: std::pin::Pin<&mut Self>,
-      cx: &mut std::task::Context<'_>,
+      mut self: std::pin::Pin<&mut Self>,
+      _cx: &mut std::task::Context<'_>,
       buf: &mut tokio::io::ReadBuf<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
+      // TODO check this
+      let remainning = buf.remaining();
+      if remainning < self.read_data.len() {
+        buf.put_slice(&self.read_data[0..remainning]);
+        self.read_data = self.read_data[remainning..].to_vec();
+      } else {
+        buf.put_slice(&self.read_data);
+        self.read_data = vec![];
+      }
+
       std::task::Poll::Ready(Ok(()))
     }
   }
@@ -424,30 +293,31 @@ mod test {
 
     fn poll_flush(
       self: std::pin::Pin<&mut Self>,
-      cx: &mut std::task::Context<'_>,
+      _cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Result<(), std::io::Error>> {
       std::task::Poll::Ready(Ok(()))
     }
 
     fn poll_shutdown(
       self: std::pin::Pin<&mut Self>,
-      cx: &mut std::task::Context<'_>,
+      _cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Result<(), std::io::Error>> {
       std::task::Poll::Ready(Ok(()))
     }
 
     fn poll_write(
-      self: std::pin::Pin<&mut Self>,
-      cx: &mut std::task::Context<'_>,
+      mut self: std::pin::Pin<&mut Self>,
+      _cx: &mut std::task::Context<'_>,
       buf: &[u8],
     ) -> std::task::Poll<Result<usize, std::io::Error>> {
-      std::task::Poll::Ready(Ok(0))
+      self.write_data.append(&mut buf.to_vec());
+      std::task::Poll::Ready(Ok(buf.len()))
     }
 
     fn poll_write_vectored(
       self: std::pin::Pin<&mut Self>,
-      cx: &mut std::task::Context<'_>,
-      bufs: &[std::io::IoSlice<'_>],
+      _cx: &mut std::task::Context<'_>,
+      _bufs: &[std::io::IoSlice<'_>],
     ) -> std::task::Poll<Result<usize, std::io::Error>> {
       std::task::Poll::Ready(Ok(0))
     }
@@ -455,7 +325,7 @@ mod test {
 
   #[tokio::test]
   async fn test_session() {
-    let stream = MockAsyncStream {};
+    let stream = MockAsyncStream::new();
     // let stream = tokio::net::TcpStream::connect("127.0.0.1:1234")
     //   .await
     //   .unwrap();

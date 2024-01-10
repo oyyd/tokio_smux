@@ -3,6 +3,7 @@ mod error;
 mod frame;
 mod session;
 mod stream;
+mod session_inner;
 
 pub use config::SmuxConfig;
 pub use error::TokioSmuxError;
