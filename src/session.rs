@@ -106,7 +106,7 @@ impl Session {
     // init SessionInner
     let (closed_tx, closed_rx) = broadcast::channel::<()>(MAX_STREAMS);
     let (write_tx, write_rx) = mpsc::channel(MAX_WRITE_REQ);
-    let (mut inner, new_frame_rx) = SessionInner::new(conn, write_rx, closed_rx.resubscribe());
+    let (mut inner, new_frame_rx, _) = SessionInner::new(conn, write_rx, closed_rx.resubscribe());
     tokio::spawn(async move {
       inner.run().await;
     });
@@ -241,12 +241,13 @@ impl Session {
 
 #[cfg(test)]
 pub mod test {
-  use crate::{session::Session, SmuxConfig};
+  use crate::{session::Session, SmuxConfig, TokioSmuxError};
   use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 
   pub struct MockAsyncStream {
     pub read_data: Vec<u8>,
     pub write_data: Vec<u8>,
+    write_error: Option<String>,
   }
 
   impl MockAsyncStream {
@@ -254,7 +255,12 @@ pub mod test {
       MockAsyncStream {
         read_data: vec![],
         write_data: vec![],
+        write_error: None,
       }
+    }
+
+    pub fn with_write_error(&mut self, error: String) {
+      self.write_error = Some(error);
     }
 
     pub fn with_read_data(&mut self, data: Vec<u8>) {
@@ -310,6 +316,10 @@ pub mod test {
       _cx: &mut std::task::Context<'_>,
       buf: &[u8],
     ) -> std::task::Poll<Result<usize, std::io::Error>> {
+      if self.write_error.is_some() {
+        let err = self.write_error.take().unwrap();
+        return std::task::Poll::Ready(Err(std::io::Error::new(std::io::ErrorKind::NotFound, err)));
+      }
       self.write_data.append(&mut buf.to_vec());
       std::task::Poll::Ready(Ok(buf.len()))
     }
