@@ -39,7 +39,7 @@ impl Default for SmuxConfig {
 
 impl SmuxConfig {
   pub fn verify_config(&self) -> Result<()> {
-    if self.version != 1 && self.version != 2 {
+    if self.version != 1 {
       return Err(TokioSmuxError::InvalidConfig {
         msg: "unsupported protocol version".to_string(),
       });

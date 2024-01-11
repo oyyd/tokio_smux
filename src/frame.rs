@@ -1,7 +1,12 @@
-use std::io::{Cursor, Read, Write};
+use std::{
+  borrow::Borrow,
+  io::{Cursor, Read, Write},
+};
 
 use crate::error::{Result, TokioSmuxError};
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
+
+pub type Sid = u32;
 
 #[derive(Clone, Copy)]
 pub enum Cmd {
@@ -58,13 +63,13 @@ pub struct Frame {
   pub cmd: Cmd,
   // TODO remove length
   pub length: u16,
-  pub sid: u32,
+  pub sid: Sid,
   // Extra data, whos length should equal to length.
   pub data: Option<Vec<u8>>,
 }
 
 impl Frame {
-  pub fn new(ver: u8, cmd: Cmd, sid: u32) -> Self {
+  pub fn new(ver: u8, cmd: Cmd, sid: Sid) -> Self {
     Self {
       ver,
       cmd,
@@ -74,7 +79,7 @@ impl Frame {
     }
   }
 
-  pub fn new_v1(cmd: Cmd, sid: u32) -> Self {
+  pub fn new_v1(cmd: Cmd, sid: Sid) -> Self {
     Self {
       ver: 1,
       cmd,
@@ -136,6 +141,28 @@ impl Frame {
       sid,
       data: None, // TODO when should we read data?
     }))
+  }
+
+  pub fn from_buf_with_data(data: &[u8]) -> Result<Option<Self>> {
+    let frame = Frame::from_buf(data);
+    if frame.is_err() {
+      return Err(frame.err().unwrap());
+    }
+
+    let frame = frame.unwrap();
+    if frame.is_none() {
+      return Ok(None);
+    }
+
+    // not enough data
+    let mut frame = frame.unwrap();
+    if data.len() < HEADER_SIZE + (frame.length as usize) {
+      return Ok(None);
+    }
+
+    let frame_data = data[HEADER_SIZE..HEADER_SIZE + (frame.length as usize)].to_vec();
+    frame.data = Some(frame_data);
+    return Ok(Some(frame));
   }
 }
 

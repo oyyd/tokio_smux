@@ -1,89 +1,25 @@
 use crate::config::SmuxConfig;
 use crate::error::{Result, TokioSmuxError};
-use crate::session_inner::{ReadRequest, SessionInner, WriteRequest};
+use crate::frame::{Cmd, Frame, Sid};
+use crate::read_frame_grouper::ReadFrameGrouper;
+use crate::session_inner::{SessionInner, WriteRequest};
 use crate::stream::Stream;
-use crate::{Cmd, Frame};
 use dashmap::DashMap;
 use std::sync::Arc;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::sync::{broadcast, mpsc, oneshot};
+use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::sync::{mpsc, oneshot};
 
+// TODO move to config
 const MAX_STREAMS: usize = 65535;
 const MAX_WRITE_REQ: usize = 1024;
-
-// Consume reading frames and split them into:
-// - Sync frames
-// - Fin and Psh frames by sid (group by sid)
-// Nop frames are discarded.
-//
-// When receive sync frames, we also need to create a sid sender of sid_tx_map.
-// When receive fin and psh frames, discard them if the sid sender doesn't exist.
-struct FrameSpliter {
-  new_frame_rx: mpsc::Receiver<ReadRequest>,
-
-  sync_tx: mpsc::Sender<Frame>,
-
-  sid_tx_map: DashMap<u32, mpsc::Sender<Frame>>,
-
-  sid_rx_map: Arc<DashMap<u32, mpsc::Receiver<Frame>>>,
-}
-
-impl FrameSpliter {
-  pub async fn run(&mut self) {
-    let result = self.run_inner().await;
-    // TODO handle error
-  }
-
-  async fn run_inner(&mut self) -> Result<()> {
-    loop {
-      let read_req = self.new_frame_rx.recv().await;
-      if read_req.is_none() {
-        break;
-      }
-
-      let read_req = read_req.unwrap();
-      let sid = read_req.frame.sid;
-
-      match read_req.frame.cmd {
-        Cmd::Sync => {
-          self.sync_tx.send(read_req.frame).await?;
-          if !self.sid_tx_map.contains_key(&sid) {
-            // TODO
-            let buffer = 1024;
-            let (tx, rx) = mpsc::channel(buffer);
-            self.sid_tx_map.insert(sid, tx);
-            self.sid_rx_map.insert(sid, rx);
-          }
-        }
-        Cmd::Fin | Cmd::Psh => {
-          if !self.sid_tx_map.contains_key(&sid) {
-            continue; // discard
-          }
-
-          let tx = self.sid_tx_map.get(&sid).unwrap();
-          tx.send(read_req.frame).await?;
-        }
-        Cmd::Udp => {
-          // discard since we don't support
-        }
-        Cmd::Nop => {
-          // discard
-        }
-      }
-    } // loop end
-
-    Ok(())
-  }
-}
+const MAX_READ_REQ: usize = 1024;
 
 pub struct Session {
   config: SmuxConfig,
 
   // current stream id
-  sid: u32,
-  // streams_controllers: DashMap<u32, Arc<RwLock<StreamController>>>,
-  closed_tx: broadcast::Sender<()>,
-  closed_rx: broadcast::Receiver<()>,
+  sid: Sid,
+
   closed: bool,
 
   write_tx: mpsc::Sender<WriteRequest>,
@@ -91,10 +27,21 @@ pub struct Session {
   go_away: bool,
 
   sync_rx: mpsc::Receiver<Frame>,
-  sid_frames_rx_map: Arc<DashMap<u32, mpsc::Receiver<Frame>>>,
+  sid_tx_map: Arc<DashMap<Sid, mpsc::Sender<Frame>>>,
+  sid_rx_map: Arc<DashMap<Sid, mpsc::Receiver<Frame>>>,
+  sid_close_tx_map: Arc<DashMap<Sid, oneshot::Sender<()>>>,
+  sid_drop_tx: mpsc::Sender<Sid>,
+
+  // TODO move to config
+  channel_buffer: usize,
 }
 
-// TODO impl drop for cleaning
+impl Drop for Session {
+  fn drop(&mut self) {
+    self.close();
+  }
+}
+
 impl Session {
   pub fn new<T: AsyncRead + AsyncWrite + Send + Unpin + 'static>(
     conn: T,
@@ -104,30 +51,33 @@ impl Session {
     config.verify_config()?;
 
     // init SessionInner
-    let (closed_tx, closed_rx) = broadcast::channel::<()>(MAX_STREAMS);
     let (write_tx, write_rx) = mpsc::channel(MAX_WRITE_REQ);
-    let (mut inner, new_frame_rx, _) = SessionInner::new(conn, write_rx, closed_rx.resubscribe());
+    let (read_tx, new_frame_rx) = mpsc::channel(MAX_READ_REQ);
+    let mut inner = SessionInner::new(conn, write_rx, read_tx);
+
+    // TODO allow out side to known session close reason/error
     tokio::spawn(async move {
-      inner.run().await;
+      inner.run(None).await;
     });
 
-    // init FrameSpliter
-    let buffer = 1024;
-    let (sync_tx, sync_rx) = mpsc::channel(buffer);
+    // init ReadFrameGrouper
+    let channel_buffer = 1024;
+    let (sync_tx, sync_rx) = mpsc::channel(channel_buffer);
+    let sid_tx_map = Arc::new(DashMap::new());
     let sid_rx_map = Arc::new(DashMap::new());
-    let sid_frames_rx_map = {
-      let map = sid_rx_map.clone();
-      let mut spliter = FrameSpliter {
-        new_frame_rx,
-        sync_tx,
-        sid_tx_map: DashMap::new(),
-        sid_rx_map,
-      };
-      tokio::spawn(async move {
-        spliter.run().await;
-      });
-      map
+    let mut spliter = ReadFrameGrouper {
+      new_frame_rx,
+      sync_tx,
+      sid_tx_map: sid_tx_map.clone(),
+      sid_rx_map: sid_rx_map.clone(),
+      sid_frame_buffer_size: channel_buffer,
     };
+    tokio::spawn(async move {
+      spliter.run().await;
+    });
+
+    // init self
+    let (sid_drop_tx, sid_drop_rx) = mpsc::channel(MAX_STREAMS);
 
     let session = Self {
       config,
@@ -135,29 +85,47 @@ impl Session {
         true => 1,
         false => 0,
       },
-      // streams_controllers: DashMap::new(),
-      closed_tx,
-      closed_rx,
       closed: false,
 
       write_tx,
       go_away: false,
 
-      sid_frames_rx_map,
+      sid_tx_map,
+      sid_rx_map,
+      sid_close_tx_map: Arc::new(DashMap::new()),
+      sid_drop_tx,
+
       sync_rx,
+
+      channel_buffer,
     };
+
+    let mut cleaner = SessionCleaner::from_session(&session, sid_drop_rx);
+    tokio::spawn(async move { cleaner.run().await });
 
     Ok(session)
   }
 
-  pub async fn close(&mut self) -> Result<()> {
+  fn peek_sid(&self) -> Sid {
+    self.sid + 2
+  }
+
+  fn close(&mut self) {
     // only once
     if self.closed {
-      return Ok(());
+      return;
     }
-    self.closed_tx.send(())?;
+
+    // close all streams
+    // TODO dead lock
+    for kv in self.sid_close_tx_map.iter_mut() {
+      let sid = kv.key();
+      let item = self.sid_close_tx_map.remove(sid);
+      let (_, tx) = item.unwrap();
+      let _ = tx.send(());
+    }
+
     self.closed = true;
-    Ok(())
   }
 
   pub async fn open_stream(&mut self) -> Result<Stream> {
@@ -180,14 +148,22 @@ impl Session {
     // New stream and write sync cmd.
     let frame = Frame::new(self.config.version, Cmd::Sync, sid);
     self.write_frame(frame).await?;
-    let stream = self.new_stream(sid);
+
+    // Update sid_tx_map and sid_rx_map when open_stream.
+    {
+      if !self.sid_tx_map.contains_key(&sid) {
+        let (tx, rx) = mpsc::channel(self.channel_buffer);
+        self.sid_tx_map.insert(sid, tx);
+        self.sid_rx_map.insert(sid, rx);
+      }
+    }
+
+    let stream = self.new_stream(sid)?;
     Ok(stream)
   }
 
-  // TODO don't give lock to users
   pub async fn accept_stream(&mut self) -> Result<Stream> {
     let frame = self.sync_rx.recv().await;
-
     if frame.is_none() {
       return Err(TokioSmuxError::SessionClosed);
     }
@@ -195,31 +171,29 @@ impl Session {
     let frame = frame.unwrap();
     let sid = frame.sid;
 
-    let stream = self.new_stream(sid);
+    let stream = self.new_stream(sid)?;
 
     Ok(stream)
   }
 
-  // 1. New a stream.
-  // 2. Create stream controller and push it.
-  fn new_stream(&mut self, sid: u32) -> Stream {
-    // TODO
-    let (frame_tx, frame_rx) = mpsc::channel(1024);
-    let (write_tx, write_rx) = mpsc::channel(1024);
+  fn new_stream(&mut self, sid: Sid) -> Result<Stream> {
+    let frame_rx = {
+      let rx = self.sid_rx_map.remove(&sid);
+      if rx.is_none() {
+        return Err(TokioSmuxError::Default {
+          msg: "unexpected empty sid in sid_rx_map".to_string(),
+        });
+      }
+      let (_id, rx) = rx.unwrap();
+      rx
+    };
+
     let (close_tx, close_rx) = oneshot::channel();
-    let stream = Stream::new(sid, frame_rx, write_tx, close_rx);
-    // TODO
-    // let controller = StreamController {};
-    // let controller = Arc::new(RwLock::new(controller));
-    // self.streams_controllers.insert(sid, controller);
+    self.sid_close_tx_map.insert(sid, close_tx);
 
-    stream
-  }
-
-  fn remove_stream_controller(&mut self, sid: u32) {
-    // if self.streams_controllers.contains_key(&sid) {
-    //   self.streams_controllers.remove(&sid);
-    // }
+    let mut stream = Stream::new(sid, frame_rx, self.write_tx.clone(), close_rx);
+    stream.with_drop_tx(Some(self.sid_drop_tx.clone()));
+    Ok(stream)
   }
 
   async fn write_frame(&mut self, frame: Frame) -> Result<()> {
@@ -239,10 +213,45 @@ impl Session {
   }
 }
 
+// Clean stream data.
+struct SessionCleaner {
+  sid_drop_rx: mpsc::Receiver<Sid>,
+
+  sid_tx_map: Arc<DashMap<Sid, mpsc::Sender<Frame>>>,
+  sid_rx_map: Arc<DashMap<Sid, mpsc::Receiver<Frame>>>,
+  sid_close_tx_map: Arc<DashMap<Sid, oneshot::Sender<()>>>,
+}
+
+impl SessionCleaner {
+  pub fn from_session(session: &Session, sid_drop_rx: mpsc::Receiver<Sid>) -> Self {
+    Self {
+      sid_drop_rx: sid_drop_rx,
+      sid_tx_map: session.sid_tx_map.clone(),
+      sid_rx_map: session.sid_rx_map.clone(),
+      sid_close_tx_map: session.sid_close_tx_map.clone(),
+    }
+  }
+
+  pub async fn run(&mut self) {
+    loop {
+      let sid = self.sid_drop_rx.recv().await;
+      if sid.is_none() {
+        break;
+      }
+
+      let sid = sid.unwrap();
+      self.sid_tx_map.remove(&sid);
+      self.sid_rx_map.remove(&sid);
+      self.sid_close_tx_map.remove(&sid);
+    }
+  }
+}
+
 #[cfg(test)]
 pub mod test {
-  use crate::{session::Session, SmuxConfig, TokioSmuxError};
-  use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+  use crate::{frame::Sid, session::Session, SmuxConfig, TokioSmuxError};
+  use tokio::io::{AsyncRead, AsyncWrite};
+  use tokio::sync::mpsc;
 
   pub struct MockAsyncStream {
     pub read_data: Vec<u8>,
@@ -272,13 +281,101 @@ pub mod test {
     }
   }
 
+  pub struct MockMpscStream {
+    // don't support large data
+    read_rx: mpsc::Receiver<Vec<u8>>,
+    write_tx: mpsc::Sender<Vec<u8>>,
+  }
+
+  impl AsyncRead for MockMpscStream {
+    fn poll_read(
+      mut self: std::pin::Pin<&mut Self>,
+      cx: &mut std::task::Context<'_>,
+      buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+      let data = self.read_rx.try_recv();
+
+      if data.is_err() {
+        let err = data.err().unwrap();
+        match err {
+          mpsc::error::TryRecvError::Disconnected => {
+            // finsiehd
+            return std::task::Poll::Ready(Ok(()));
+          }
+          mpsc::error::TryRecvError::Empty => {
+            let waker = cx.waker().clone();
+            tokio::spawn(async move {
+              tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+              waker.wake_by_ref();
+            });
+
+            return std::task::Poll::Pending;
+          }
+        }
+      }
+
+      let read_data = data.unwrap();
+      let remainning = buf.remaining();
+      if remainning < read_data.len() {
+        buf.put_slice(&read_data[0..remainning]);
+      } else {
+        buf.put_slice(&read_data);
+      }
+      std::task::Poll::Ready(Ok(()))
+    }
+  }
+
+  impl AsyncWrite for MockMpscStream {
+    fn is_write_vectored(&self) -> bool {
+      return false;
+    }
+
+    fn poll_flush(
+      self: std::pin::Pin<&mut Self>,
+      _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), std::io::Error>> {
+      std::task::Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(
+      self: std::pin::Pin<&mut Self>,
+      _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), std::io::Error>> {
+      std::task::Poll::Ready(Ok(()))
+    }
+
+    fn poll_write(
+      self: std::pin::Pin<&mut Self>,
+      _cx: &mut std::task::Context<'_>,
+      buf: &[u8],
+    ) -> std::task::Poll<Result<usize, std::io::Error>> {
+      let res = self.write_tx.try_send(buf.to_vec());
+      if res.is_err() {
+        // closed
+        return std::task::Poll::Ready(Err(std::io::Error::new(
+          std::io::ErrorKind::AddrInUse,
+          "mock error",
+        )));
+      }
+
+      std::task::Poll::Ready(Ok(buf.len()))
+    }
+
+    fn poll_write_vectored(
+      self: std::pin::Pin<&mut Self>,
+      _cx: &mut std::task::Context<'_>,
+      _bufs: &[std::io::IoSlice<'_>],
+    ) -> std::task::Poll<Result<usize, std::io::Error>> {
+      std::task::Poll::Ready(Ok(0))
+    }
+  }
+
   impl AsyncRead for MockAsyncStream {
     fn poll_read(
       mut self: std::pin::Pin<&mut Self>,
       _cx: &mut std::task::Context<'_>,
       buf: &mut tokio::io::ReadBuf<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
-      // TODO check this
       let remainning = buf.remaining();
       if remainning < self.read_data.len() {
         buf.put_slice(&self.read_data[0..remainning]);
@@ -333,13 +430,113 @@ pub mod test {
     }
   }
 
-  #[tokio::test]
-  async fn test_session() {
-    let stream = MockAsyncStream::new();
-    // let stream = tokio::net::TcpStream::connect("127.0.0.1:1234")
-    //   .await
-    //   .unwrap();
+  use crate::frame::{Cmd, Frame, HEADER_SIZE};
 
-    let session = Session::new(stream, SmuxConfig::default(), true);
+  #[tokio::test]
+  async fn test_session_client() {
+    let init_sid: Sid = 3;
+    let (read_tx, read_rx) = mpsc::channel(1024);
+    let (write_tx, mut write_rx) = mpsc::channel(1024);
+    let conn = MockMpscStream { read_rx, write_tx };
+    let mut client = Session::new(conn, SmuxConfig::default(), true).unwrap();
+    let sid = client.peek_sid();
+    let mut stream = client.open_stream().await.unwrap();
+    assert_eq!(init_sid, stream.sid());
+    assert_eq!(sid, stream.sid());
+
+    // opening stream writes some data to the remote
+    let data = write_rx.recv().await;
+    assert!(data.is_some());
+    let data = data.unwrap();
+    let frame = Frame::from_buf(&data).unwrap().unwrap();
+    assert!(matches!(frame.cmd, Cmd::Sync));
+
+    // mock remote sending data to the stream
+    let mut frame = Frame::new_v1(Cmd::Psh, init_sid);
+    frame.with_data("hello!".as_bytes().to_vec());
+    read_tx.send(frame.get_buf().unwrap()).await.unwrap();
+
+    let msg = stream.recv_message().await.unwrap();
+    assert_eq!(String::from_utf8_lossy(&msg).as_ref(), "hello!");
+
+    // write some data
+    stream
+      .send_message("world!".as_bytes().to_vec())
+      .await
+      .unwrap();
+
+    let data = write_rx.recv().await.unwrap();
+    let frame = Frame::from_buf(&data).unwrap().unwrap();
+    assert!(matches!(frame.cmd, Cmd::Psh));
+    let frame_data = &data[(HEADER_SIZE as usize)..HEADER_SIZE + (frame.length as usize)];
+    assert_eq!(String::from_utf8_lossy(frame_data).as_ref(), "world!");
+
+    // write again
+    stream
+      .send_message("world!!".as_bytes().to_vec())
+      .await
+      .unwrap();
+    let data = write_rx.recv().await.unwrap();
+    let frame = Frame::from_buf(&data).unwrap().unwrap();
+    assert!(matches!(frame.cmd, Cmd::Psh));
+    let frame_data = &data[(HEADER_SIZE as usize)..HEADER_SIZE + (frame.length as usize)];
+    assert_eq!(String::from_utf8_lossy(frame_data).as_ref(), "world!!");
+
+    // close the stream should also cleanup its frame data
+    drop(stream);
+
+    // clean up after a while
+    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    assert!(client.sid_tx_map.get(&sid).is_none());
+    assert!(client.sid_rx_map.get(&sid).is_none());
+    assert!(client.sid_close_tx_map.get(&sid).is_none());
+
+    // the remote should also receive the fin
+    let data = write_rx.recv().await.unwrap();
+    let frame = Frame::from_buf(&data).unwrap().unwrap();
+    assert!(matches!(frame.cmd, Cmd::Fin));
+  }
+
+  #[tokio::test]
+  async fn test_session_server() {
+    let (read_tx, read_rx) = mpsc::channel(1024);
+    let (write_tx, mut write_rx) = mpsc::channel(1024);
+    let conn = MockMpscStream { read_rx, write_tx };
+    let mut server = Session::new(conn, SmuxConfig::default(), true).unwrap();
+
+    let sid = 3;
+    // send nop frame
+    let frame = Frame::new_v1(Cmd::Nop, 0);
+    read_tx.send(frame.get_buf().unwrap()).await.unwrap();
+    // mock sync frame
+    let frame = Frame::new_v1(Cmd::Sync, sid);
+    read_tx.send(frame.get_buf().unwrap()).await.unwrap();
+
+    let mut stream = server.accept_stream().await.unwrap();
+    assert_eq!(stream.sid(), sid);
+
+    // ok to write some data
+    stream
+      .send_message("Hello from server".as_bytes().to_vec())
+      .await
+      .unwrap();
+
+    let data = write_rx.recv().await.unwrap();
+    let frame = Frame::from_buf_with_data(&data).unwrap().unwrap();
+    assert_eq!(
+      String::from_utf8_lossy(&frame.data.unwrap()),
+      "Hello from server"
+    );
+
+    // drop server to make stream stop
+    drop(server);
+
+    // clean up after a while
+    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+    // TODO
+    let res = stream.send_message(vec![0; 10]).await;
+    assert!(res.is_err());
+    // matches!(res.err().unwrap(), TokioSmuxError::SessionClosed);
   }
 }

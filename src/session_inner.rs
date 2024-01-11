@@ -1,11 +1,11 @@
 use std::borrow::BorrowMut;
-use std::future::{self, Future};
+use std::future;
 
 use crate::error::{Result, TokioSmuxError};
 use crate::frame::HEADER_SIZE;
 use crate::{Cmd, Frame};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::sync::{broadcast, mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot};
 use tokio::time;
 
 pub(crate) struct WriteRequest {
@@ -22,10 +22,8 @@ pub(crate) struct SessionInner<T: AsyncRead + AsyncWrite + Send + Unpin + 'stati
   conn: T,
 
   // Receive write requests and handle writing.
+  // Cloes write channel to close the SessionInner.
   write_rx: mpsc::Receiver<WriteRequest>,
-
-  // Receive close request and stop the connection.
-  close_rx: broadcast::Receiver<()>,
 
   // Send new frames to outside.
   recv_tx: mpsc::Sender<ReadRequest>,
@@ -35,49 +33,37 @@ pub(crate) struct SessionInner<T: AsyncRead + AsyncWrite + Send + Unpin + 'stati
 
   read_finished: bool,
 
-  error_tx: Option<oneshot::Sender<TokioSmuxError>>,
-
   keep_alive_interval: Option<time::Duration>,
-  // TODO support keep_alive_timeout
+  // FEATURE: support keep_alive_timeout
 }
 
-// TODO add a method to close the connection.
 impl<T: AsyncRead + AsyncWrite + Send + Unpin + 'static> SessionInner<T> {
   pub fn new(
     conn: T,
     write_rx: mpsc::Receiver<WriteRequest>,
-    close_rx: broadcast::Receiver<()>,
-  ) -> (
-    Self,
-    mpsc::Receiver<ReadRequest>, // TODO receive channels from outside
-    oneshot::Receiver<TokioSmuxError>,
-  ) {
-    let buffer: usize = 1024;
-    let (recv_tx, recv_rx) = mpsc::channel(buffer);
-    let (error_tx, error_rx) = oneshot::channel();
-
+    recv_tx: mpsc::Sender<ReadRequest>,
+  ) -> Self {
     let inner = Self {
       conn,
       write_rx,
-      close_rx,
       recv_tx,
       read_buf: vec![],
       read_finished: false,
-      error_tx: Some(error_tx),
       keep_alive_interval: None,
     };
 
-    (inner, recv_rx, error_rx)
+    inner
   }
 
   pub fn with_keep_alive_interval(&mut self, duration: time::Duration) {
     self.keep_alive_interval = Some(duration);
   }
 
-  pub async fn run(&mut self) {
+  pub async fn run(&mut self, error_tx: Option<oneshot::Sender<TokioSmuxError>>) {
     let res = self.run_inner().await;
     if res.is_err() {
-      self.error_tx.take().map(|tx| tx.send(res.err().unwrap()));
+      let err = res.err().unwrap();
+      error_tx.map(|tx| tx.send(err));
     }
   }
 
@@ -105,7 +91,6 @@ impl<T: AsyncRead + AsyncWrite + Send + Unpin + 'static> SessionInner<T> {
     i.tick().await;
   }
 
-  // TODO add keep-alive looping
   // Should return Err only when the error is not recoverable.
   async fn run_inner(&mut self) -> Result<()> {
     let mut data: Vec<u8> = vec![0; 65535];
@@ -122,14 +107,6 @@ impl<T: AsyncRead + AsyncWrite + Send + Unpin + 'static> SessionInner<T> {
       let read_finished = self.read_finished;
 
       tokio::select! {
-        // write
-        req = self.write_rx.recv() => {
-          if req.is_none() {
-            // Write_rx is closed, means the session is removed.
-            break;
-          }
-          self.handle_write_req(req.unwrap()).await?;
-        }
         // read
         size = SessionInner::read_or_pending_if_finished(conn, &mut data, read_finished) => {
           let size = size?;
@@ -140,13 +117,17 @@ impl<T: AsyncRead + AsyncWrite + Send + Unpin + 'static> SessionInner<T> {
           }
           self.handle_read_data(&data[0..size])?;
         }
+        // write
+        req = self.write_rx.recv() => {
+          if req.is_none() {
+            // Session closed, stop running.
+            break;
+          }
+          self.handle_write_req(req.unwrap()).await?;
+        }
         // keep alive
         _ = SessionInner::<T>::keep_alive_tick(interval.as_mut()) => {
           self.handle_keep_alive_interval_tick().await?;
-        }
-        // close
-        _ = self.close_rx.recv() => {
-          break; // don't loop anymore when closed
         }
       }
     }
@@ -252,12 +233,13 @@ mod test {
     let mut stream = MockAsyncStream::new();
     stream.with_read_data(data_to_read);
 
+    let buffer = 1024;
+    let (recv_tx, mut recv_rx) = mpsc::channel(buffer);
     let (write_tx, write_rx) = mpsc::channel(1024);
-    let (close_tx, close_rx) = broadcast::channel(1024);
-    let (mut inner, mut read_rx, _) = SessionInner::new(stream, write_rx, close_rx);
+    let mut inner = SessionInner::new(stream, write_rx, recv_tx);
 
     let join = tokio::spawn(async move {
-      inner.run().await;
+      inner.run(None).await;
 
       inner
     });
@@ -273,7 +255,7 @@ mod test {
     // wait for writting to finish
     finish_rx.await.unwrap();
 
-    let read_req = read_rx.recv().await;
+    let read_req = recv_rx.recv().await;
     assert!(read_req.is_some());
     let read_req = read_req.unwrap();
     assert!(matches!(read_req.frame.cmd, Cmd::Psh));
@@ -282,7 +264,7 @@ mod test {
     assert_eq!(data.len(), test_data_size);
 
     // stop inner to check write data
-    close_tx.send(()).unwrap();
+    drop(write_tx);
     let inner = join.await.unwrap();
     assert_eq!(inner.conn.write_data.len(), HEADER_SIZE);
   }
@@ -294,11 +276,12 @@ mod test {
     stream.with_write_error(err_msg.clone());
 
     let (write_tx, write_rx) = mpsc::channel(1024);
-    let (_close_tx, close_rx) = broadcast::channel(1024);
-    let (mut inner, read_rx, error_rx) = SessionInner::new(stream, write_rx, close_rx);
+    let (recv_tx, recv_rx) = mpsc::channel(1024);
+    let (error_tx, error_rx) = oneshot::channel();
+    let mut inner = SessionInner::new(stream, write_rx, recv_tx);
 
     let join = tokio::spawn(async move {
-      inner.run().await;
+      inner.run(Some(error_tx)).await;
 
       inner
     });
@@ -322,15 +305,15 @@ mod test {
   async fn test_session_inner_keep_alive_interval() {
     let stream = MockAsyncStream::new();
 
-    let (_write_tx, write_rx) = mpsc::channel(1024);
-    let (close_tx, close_rx) = broadcast::channel(1024);
-    let (mut inner, _read_rx, _) = SessionInner::new(stream, write_rx, close_rx);
+    let (write_tx, write_rx) = mpsc::channel(1024);
+    let (recv_tx, recv_rx) = mpsc::channel(1024);
+    let mut inner = SessionInner::new(stream, write_rx, recv_tx);
 
     let duration = std::time::Duration::from_millis(10);
     inner.with_keep_alive_interval(duration);
 
     let join = tokio::spawn(async move {
-      inner.run().await;
+      inner.run(None).await;
       inner
     });
 
@@ -340,7 +323,7 @@ mod test {
     ))
     .await;
 
-    close_tx.send(()).unwrap();
+    drop(write_tx);
 
     let inner = join.await.unwrap();
     assert!(inner.conn.write_data.len() >= 8);

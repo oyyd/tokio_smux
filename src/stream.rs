@@ -1,5 +1,5 @@
 use crate::error::{Result, TokioSmuxError};
-use crate::frame::{Cmd, Frame};
+use crate::frame::{Cmd, Frame, Sid};
 use crate::session_inner::WriteRequest;
 use tokio::sync::{mpsc, oneshot};
 
@@ -8,12 +8,14 @@ use tokio::sync::{mpsc, oneshot};
 // 2. close by session (should send fin to remote)
 // 3. close by stream (should send fin to remote)
 pub struct Stream {
-  sid: u32,
+  sid: Sid,
 
+  // Cloes this channel to stop the stream.
   frame_rx: mpsc::Receiver<Frame>,
   write_tx: Option<mpsc::Sender<WriteRequest>>,
   // Disallow write operations after receiving from close_rx.
   close_rx: oneshot::Receiver<()>,
+  drop_tx: Option<mpsc::Sender<Sid>>,
 
   receive_remote_fin: bool,
   closed: bool,
@@ -21,6 +23,17 @@ pub struct Stream {
 
 impl Drop for Stream {
   fn drop(&mut self) {
+    let sid = self.sid;
+
+    // - Inform the session of our dropping.
+    if self.drop_tx.is_some() {
+      let drop_tx = self.drop_tx.take().unwrap();
+      tokio::spawn(async move {
+        let _ = drop_tx.send(sid).await;
+      });
+    }
+
+    // - Send fin to the remote.
     // Don't send fin if it has received fin.
     if self.receive_remote_fin {
       return;
@@ -30,7 +43,6 @@ impl Drop for Stream {
     if write_tx.is_none() {
       return;
     }
-    let sid = self.sid;
     let write_tx = write_tx.unwrap();
     tokio::spawn(async move {
       // allow failure
@@ -40,9 +52,9 @@ impl Drop for Stream {
 }
 
 impl Stream {
-  // Let session pass these parameters therefore we could control channel capabilities from outside.
+  // Let session passes these parameters therefore we could control channel capabilities from outside.
   pub(crate) fn new(
-    sid: u32,
+    sid: Sid,
     frame_rx: mpsc::Receiver<Frame>,
     write_tx: mpsc::Sender<WriteRequest>,
     close_rx: oneshot::Receiver<()>,
@@ -52,17 +64,22 @@ impl Stream {
       frame_rx,
       write_tx: Some(write_tx),
       close_rx,
+      drop_tx: None,
       receive_remote_fin: false,
       closed: false,
     }
   }
 
-  pub async fn send_message(&mut self, data: Vec<u8>) -> Result<()> {
-    if self.closed || self.receive_remote_fin {
-      return Err(TokioSmuxError::StreamClosed);
-    }
+  pub fn sid(&self) -> Sid {
+    self.sid
+  }
 
-    if self.is_closed_by_session() {
+  pub(crate) fn with_drop_tx(&mut self, drop_tx: Option<mpsc::Sender<Sid>>) {
+    self.drop_tx = drop_tx;
+  }
+
+  pub async fn send_message(&mut self, data: Vec<u8>) -> Result<()> {
+    if self.is_not_writable() {
       return Err(TokioSmuxError::StreamClosed);
     }
 
@@ -121,9 +138,9 @@ impl Stream {
     }
   }
 
-  fn is_closed_by_session(&mut self) -> bool {
-    // If already closed by stream, return true directly.
-    if self.closed {
+  fn is_not_writable(&mut self) -> bool {
+    // If already closed by stream or the remote, return true directly.
+    if self.closed || self.receive_remote_fin {
       return true;
     }
 
@@ -143,7 +160,7 @@ impl Stream {
     }
   }
 
-  async fn send_fin(sid: u32, write_tx: mpsc::Sender<WriteRequest>) -> Result<()> {
+  async fn send_fin(sid: Sid, write_tx: mpsc::Sender<WriteRequest>) -> Result<()> {
     let frame = Frame::new_v1(Cmd::Fin, sid);
 
     write_tx
@@ -316,5 +333,23 @@ mod test {
     // the remote should receive fin
     drop(stream);
     recv_fin_rx.await.unwrap();
+  }
+
+  #[tokio::test]
+  async fn test_stream_drop_tx() {
+    let sid = 1;
+    let size = 1024;
+    let (_frame_tx, frame_rx) = mpsc::channel(size);
+    let (write_tx, _write_rx) = mpsc::channel(size);
+    let (_close_tx, close_rx) = oneshot::channel();
+    let (drop_tx, mut drop_rx) = mpsc::channel(1024);
+
+    let mut stream = Stream::new(sid, frame_rx, write_tx, close_rx);
+    stream.with_drop_tx(Some(drop_tx));
+
+    drop(stream);
+
+    let id = drop_rx.recv().await.unwrap();
+    assert_eq!(id, sid);
   }
 }
