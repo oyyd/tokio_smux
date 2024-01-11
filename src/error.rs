@@ -2,7 +2,7 @@ use thiserror::Error;
 
 pub type Result<T> = std::result::Result<T, TokioSmuxError>;
 
-#[derive(Debug, Error)]
+#[derive(Debug, Error, Clone)]
 pub enum TokioSmuxError {
   #[error("receive invalid cmd: {cmd}")]
   FrameParseCmdError { cmd: u8 },
@@ -30,6 +30,9 @@ pub enum TokioSmuxError {
 
   #[error("tokio send error: {inner}")]
   TokioSendError { inner: String },
+
+  #[error("receive inner stream err: {msg}")]
+  InnerStreamError { msg: String },
 
   #[error("{msg}")]
   Default { msg: String },

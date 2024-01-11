@@ -20,8 +20,6 @@ pub struct Session {
   // current stream id
   sid: Sid,
 
-  closed: bool,
-
   write_tx: mpsc::Sender<WriteRequest>,
 
   go_away: bool,
@@ -32,13 +30,26 @@ pub struct Session {
   sid_close_tx_map: Arc<DashMap<Sid, oneshot::Sender<()>>>,
   sid_drop_tx: mpsc::Sender<Sid>,
 
+  inner_err: Option<TokioSmuxError>,
+  inner_err_rx: oneshot::Receiver<TokioSmuxError>,
+
   // TODO move to config
   channel_buffer: usize,
 }
 
 impl Drop for Session {
   fn drop(&mut self) {
-    self.close();
+    // close all streams
+    let mut keys: Vec<Sid> = vec![];
+    for kv in self.sid_close_tx_map.iter() {
+      let sid = kv.key();
+      keys.push(*sid);
+    }
+    for id in keys {
+      let item = self.sid_close_tx_map.remove(&id);
+      let (_, tx) = item.unwrap();
+      let _ = tx.send(());
+    }
   }
 }
 
@@ -54,10 +65,9 @@ impl Session {
     let (write_tx, write_rx) = mpsc::channel(MAX_WRITE_REQ);
     let (read_tx, new_frame_rx) = mpsc::channel(MAX_READ_REQ);
     let mut inner = SessionInner::new(conn, write_rx, read_tx);
-
-    // TODO allow out side to known session close reason/error
+    let (inner_err_tx, inner_err_rx) = oneshot::channel();
     tokio::spawn(async move {
-      inner.run(None).await;
+      inner.run(Some(inner_err_tx)).await;
     });
 
     // init ReadFrameGrouper
@@ -85,7 +95,6 @@ impl Session {
         true => 1,
         false => 0,
       },
-      closed: false,
 
       write_tx,
       go_away: false,
@@ -96,6 +105,8 @@ impl Session {
       sid_drop_tx,
 
       sync_rx,
+      inner_err: None,
+      inner_err_rx,
 
       channel_buffer,
     };
@@ -106,37 +117,35 @@ impl Session {
     Ok(session)
   }
 
-  fn peek_sid(&self) -> Sid {
-    self.sid + 2
+  pub fn get_inner_err(&mut self) -> Option<TokioSmuxError> {
+    if self.inner_err.is_some() {
+      return self.inner_err.clone();
+    }
+
+    let res = self.inner_err_rx.try_recv();
+    if res.is_ok() {
+      self.inner_err = Some(res.unwrap());
+    }
+
+    return self.inner_err.clone();
   }
 
-  fn close(&mut self) {
-    // only once
-    if self.closed {
-      return;
+  fn inner_ok(&mut self) -> Result<()> {
+    let err = self.get_inner_err();
+    if err.is_none() {
+      return Ok(());
     }
-
-    // close all streams
-    // TODO dead lock
-    for kv in self.sid_close_tx_map.iter_mut() {
-      let sid = kv.key();
-      let item = self.sid_close_tx_map.remove(sid);
-      let (_, tx) = item.unwrap();
-      let _ = tx.send(());
-    }
-
-    self.closed = true;
+    return Err(err.unwrap());
   }
 
   pub async fn open_stream(&mut self) -> Result<Stream> {
-    if self.closed {
-      return Err(TokioSmuxError::SessionClosed);
-    }
-
     // Check if stream id overflows.
     if self.go_away {
       return Err(TokioSmuxError::SessionGoAway);
     }
+
+    // Check inner error.
+    self.inner_ok()?;
 
     self.sid += 2;
     if self.sid == self.sid % 2 {
@@ -163,6 +172,9 @@ impl Session {
   }
 
   pub async fn accept_stream(&mut self) -> Result<Stream> {
+    // Check inner error.
+    self.inner_ok()?;
+
     let frame = self.sync_rx.recv().await;
     if frame.is_none() {
       return Err(TokioSmuxError::SessionClosed);
@@ -434,14 +446,12 @@ pub mod test {
 
   #[tokio::test]
   async fn test_session_client() {
-    let init_sid: Sid = 3;
+    let sid: Sid = 3;
     let (read_tx, read_rx) = mpsc::channel(1024);
     let (write_tx, mut write_rx) = mpsc::channel(1024);
     let conn = MockMpscStream { read_rx, write_tx };
     let mut client = Session::new(conn, SmuxConfig::default(), true).unwrap();
-    let sid = client.peek_sid();
     let mut stream = client.open_stream().await.unwrap();
-    assert_eq!(init_sid, stream.sid());
     assert_eq!(sid, stream.sid());
 
     // opening stream writes some data to the remote
@@ -452,7 +462,7 @@ pub mod test {
     assert!(matches!(frame.cmd, Cmd::Sync));
 
     // mock remote sending data to the stream
-    let mut frame = Frame::new_v1(Cmd::Psh, init_sid);
+    let mut frame = Frame::new_v1(Cmd::Psh, sid);
     frame.with_data("hello!".as_bytes().to_vec());
     read_tx.send(frame.get_buf().unwrap()).await.unwrap();
 
@@ -502,7 +512,7 @@ pub mod test {
     let (read_tx, read_rx) = mpsc::channel(1024);
     let (write_tx, mut write_rx) = mpsc::channel(1024);
     let conn = MockMpscStream { read_rx, write_tx };
-    let mut server = Session::new(conn, SmuxConfig::default(), true).unwrap();
+    let mut server = Session::new(conn, SmuxConfig::default(), false).unwrap();
 
     let sid = 3;
     // send nop frame
@@ -533,10 +543,36 @@ pub mod test {
 
     // clean up after a while
     tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-
-    // TODO
     let res = stream.send_message(vec![0; 10]).await;
     assert!(res.is_err());
-    // matches!(res.err().unwrap(), TokioSmuxError::SessionClosed);
+    assert!(matches!(res.err().unwrap(), TokioSmuxError::StreamClosed));
+  }
+
+  #[tokio::test]
+  async fn test_session_error() {
+    let (read_tx, read_rx) = mpsc::channel(1024);
+    let (write_tx, mut write_rx) = mpsc::channel(1024);
+    let conn = MockMpscStream { read_rx, write_tx };
+    let mut client = Session::new(conn, SmuxConfig::default(), true).unwrap();
+
+    // close the write channel to mock error
+    drop(write_rx);
+
+    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+    // write some data to pretend inner write operation
+    let stream = client.open_stream().await;
+    assert!(stream.is_err());
+
+    // expect inner error
+    let stream = client.open_stream().await;
+    assert!(stream.is_err());
+    assert_eq!(stream.err().unwrap().to_string(), "mock error");
+    // still get same error
+    let stream = client.open_stream().await;
+    assert!(stream.is_err());
+    assert_eq!(stream.err().unwrap().to_string(), "mock error");
+
+    assert!(client.get_inner_err().is_some());
   }
 }
