@@ -25,6 +25,11 @@ pub enum TokioSmuxError {
   #[error("stream receives unexpected cmd: {cmd_value}")]
   StreamReceiveUnexpectedCmd { cmd_value: u8 },
 
+  #[error(
+    "stream try to write large frame data, please ensure the size of data is smaller than 65535"
+  )]
+  StreamWriteTooLargeData,
+
   #[error("tokio recv error: {inner}")]
   TokioRecvError { inner: String },
 

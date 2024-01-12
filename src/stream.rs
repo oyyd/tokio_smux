@@ -79,6 +79,10 @@ impl Stream {
   }
 
   pub async fn send_message(&mut self, data: Vec<u8>) -> Result<()> {
+    if data.len() > (u16::MAX as usize) {
+      return Err(TokioSmuxError::StreamWriteTooLargeData);
+    }
+
     if self.is_not_writable() {
       return Err(TokioSmuxError::StreamClosed);
     }
@@ -190,6 +194,9 @@ mod test {
     let (_close_tx, close_rx) = oneshot::channel();
 
     let mut stream = Stream::new(sid, frame_rx, write_tx, close_rx);
+
+    // writing too large data should fail
+    assert!(stream.send_message(vec![0; 65536]).await.is_err());
 
     // push some frames to read
     tokio::spawn(async move {

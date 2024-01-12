@@ -37,6 +37,7 @@ pub struct Session {
   channel_buffer: usize,
 }
 
+// TODO don't show channel closed error
 impl Drop for Session {
   fn drop(&mut self) {
     // close all streams
@@ -54,7 +55,21 @@ impl Drop for Session {
 }
 
 impl Session {
-  pub fn new<T: AsyncRead + AsyncWrite + Send + Unpin + 'static>(
+  pub fn new_client<T: AsyncRead + AsyncWrite + Send + Unpin + 'static>(
+    conn: T,
+    config: SmuxConfig,
+  ) -> Result<Self> {
+    return Session::new(conn, config, true);
+  }
+
+  pub fn new_server<T: AsyncRead + AsyncWrite + Send + Unpin + 'static>(
+    conn: T,
+    config: SmuxConfig,
+  ) -> Result<Self> {
+    return Session::new(conn, config, false);
+  }
+
+  fn new<T: AsyncRead + AsyncWrite + Send + Unpin + 'static>(
     conn: T,
     config: SmuxConfig,
     is_client: bool,
@@ -288,6 +303,7 @@ pub mod test {
       self.read_data = data;
     }
 
+    #[allow(dead_code)]
     pub fn with_write_data(&mut self, data: Vec<u8>) {
       self.write_data = data;
     }
@@ -550,8 +566,8 @@ pub mod test {
 
   #[tokio::test]
   async fn test_session_error() {
-    let (read_tx, read_rx) = mpsc::channel(1024);
-    let (write_tx, mut write_rx) = mpsc::channel(1024);
+    let (_read_tx, read_rx) = mpsc::channel(1024);
+    let (write_tx, write_rx) = mpsc::channel(1024);
     let conn = MockMpscStream { read_rx, write_tx };
     let mut client = Session::new(conn, SmuxConfig::default(), true).unwrap();
 

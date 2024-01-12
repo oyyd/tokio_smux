@@ -183,8 +183,9 @@ impl<T: AsyncRead + AsyncWrite + Send + Unpin + 'static> SessionInner<T> {
       }
       let mut frame = frame.unwrap();
       let frame_length = frame.length;
+      // TODO add a test for this to ensure error pops
       // check if all data ready
-      if (frame_length + HEADER_SIZE as u16) > (self.read_buf.len() as u16) {
+      if (frame_length as u32 + HEADER_SIZE as u32) > (self.read_buf.len() as u32) {
         // not enough data
         break;
       }
@@ -225,7 +226,7 @@ mod test {
   #[tokio::test]
   async fn test_session_inner() {
     let sid = 3;
-    let test_data_size = 2;
+    let test_data_size = 65535;
     let mut frame = Frame::new_v1(Cmd::Psh, 3);
     frame.with_data(vec![0; test_data_size]);
     let data_to_read = frame.get_buf().unwrap();
