@@ -511,7 +511,6 @@ pub mod test {
 
     let data = write_rx.recv().await.unwrap();
     let frame = Frame::from_buf(&data).unwrap().unwrap();
-    let val: u8 = frame.cmd.into();
     assert!(matches!(frame.cmd, Cmd::Psh));
     let frame_data = &data[(HEADER_SIZE as usize)..HEADER_SIZE + (frame.length as usize)];
     assert_eq!(String::from_utf8_lossy(frame_data).as_ref(), "world!");

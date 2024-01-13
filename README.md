@@ -1,6 +1,6 @@
 # tokio_smux
 
-TODO test badge TODO version badge
+[![Build And Test](https://github.com/oyyd/tokio_smux/actions/workflows/build_and_test.yml/badge.svg)](https://github.com/oyyd/tokio_smux/actions) [![crates.io](https://img.shields.io/crates/v/tokio_smux.svg)](https://crates.io/crates/tokio_smux)
 
 tokio_smux is an implementation of [smux](https://github.com/xtaci/smux/) in Rust, which is a stream multiplexing library in Golang.
 
