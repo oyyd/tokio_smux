@@ -14,11 +14,11 @@ Tokio_smux can work with tokio [TcpStream](https://docs.rs/tokio/latest/tokio/ne
 
 See [examples](./examples)
 
-## Smux Protocol Implementation Status
+## Smux Protocol Implementation
 
 The smux protocl version 2 is not yet supported.
 
-## Why doesn't `Stream` of tokio_smux impl `AsyncRead` and `AysncWrite` itself?
+**Why doesn't `Stream` of tokio_smux impl `AsyncRead` and `AysncWrite` itself?**
 
 Becuase the smux protocol uses frames, means all user data transfered is wrapped in frames of fixed lengths. Similar to the websocket protocol.
 
