@@ -57,15 +57,15 @@ impl ReadFrameGrouper {
 
   async fn handle_sync(&mut self, read_req: ReadRequest) {
     let sid = read_req.frame.sid;
-    let send_sync_tx_res = self.sync_tx.send(read_req.frame).await;
-    if send_sync_tx_res.is_err() {
-      // session closed, ingore all operations
-      return;
-    }
     if !self.sid_tx_map.contains_key(&sid) {
       let (tx, rx) = mpsc::channel(self.sid_frame_buffer_size);
       self.sid_tx_map.insert(sid, tx);
       self.sid_rx_map.insert(sid, rx);
+    }
+    let send_sync_tx_res = self.sync_tx.send(read_req.frame).await;
+    if send_sync_tx_res.is_err() {
+      // session closed
+      return;
     }
   }
 

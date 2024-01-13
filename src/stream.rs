@@ -24,7 +24,6 @@ pub struct Stream {
 impl Drop for Stream {
   fn drop(&mut self) {
     let sid = self.sid;
-
     // - Inform the session of our dropping.
     if self.drop_tx.is_some() {
       let drop_tx = self.drop_tx.take().unwrap();
@@ -108,13 +107,17 @@ impl Stream {
     Ok(())
   }
 
-  pub async fn recv_message(&mut self) -> Result<Vec<u8>> {
+  pub async fn recv_message(&mut self) -> Result<Option<Vec<u8>>> {
     // We don't check close_rx here because we still allow the stream to consume
     // rest data.
+    if self.receive_remote_fin {
+      return Ok(None);
+    }
+
     // And outside sessions should also close the frame_rx.
     let msg = self.frame_rx.recv().await;
     if msg.is_none() {
-      // closed
+      // session closed
       return Err(TokioSmuxError::StreamClosed);
     }
 
@@ -123,7 +126,7 @@ impl Stream {
     match msg.cmd {
       Cmd::Fin => {
         self.receive_remote_fin = true;
-        return Err(TokioSmuxError::StreamClosed);
+        return Ok(None);
       }
       Cmd::Psh => {
         if msg.data.is_none() {
@@ -132,7 +135,7 @@ impl Stream {
           });
         }
         let data = msg.data.unwrap();
-        return Ok(data);
+        return Ok(Some(data));
       }
       _ => {
         return Err(TokioSmuxError::StreamReceiveUnexpectedCmd {
@@ -233,17 +236,16 @@ mod test {
     {
       stream.send_message(vec![0; 10]).await.unwrap();
       let msg = stream.recv_message().await.unwrap();
-      assert!(msg.len() > 0);
+      assert!(msg.is_some());
+      assert!(msg.unwrap().len() > 0);
 
       // test receive fin
       let msg = stream.recv_message().await;
-      assert!(msg.is_err());
-      let is_stream_close_err = matches!(msg.err().unwrap(), TokioSmuxError::StreamClosed);
-      assert!(is_stream_close_err);
+      assert!(msg.is_ok());
+      assert!(msg.unwrap().is_none());
       // do not write anymore
       let write_res = stream.send_message(vec![0; 10]).await;
       assert!(write_res.is_err());
-
       assert!(stream.receive_remote_fin);
     };
   }

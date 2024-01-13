@@ -80,6 +80,9 @@ impl Session {
     let (write_tx, write_rx) = mpsc::channel(MAX_WRITE_REQ);
     let (read_tx, new_frame_rx) = mpsc::channel(MAX_READ_REQ);
     let mut inner = SessionInner::new(conn, write_rx, read_tx);
+    if !config.keep_alive_disable {
+      inner.with_keep_alive_interval(config.keep_alive_interval)
+    }
     let (inner_err_tx, inner_err_rx) = oneshot::channel();
     tokio::spawn(async move {
       inner.run(Some(inner_err_tx)).await;
@@ -132,6 +135,10 @@ impl Session {
     Ok(session)
   }
 
+  pub fn inner_keys(&self) -> i32 {
+    (self.sid_close_tx_map.len() + self.sid_tx_map.len() + self.sid_rx_map.len()) as i32
+  }
+
   pub fn get_inner_err(&mut self) -> Option<TokioSmuxError> {
     if self.inner_err.is_some() {
       return self.inner_err.clone();
@@ -181,9 +188,13 @@ impl Session {
         self.sid_rx_map.insert(sid, rx);
       }
     }
-
-    let stream = self.new_stream(sid)?;
-    Ok(stream)
+    let stream = self.new_stream(sid);
+    if stream.is_err() {
+      // not likely
+      self.sid_tx_map.remove(&sid);
+      self.sid_rx_map.remove(&sid);
+    }
+    Ok(stream.unwrap())
   }
 
   pub async fn accept_stream(&mut self) -> Result<Stream> {
@@ -460,13 +471,20 @@ pub mod test {
 
   use crate::frame::{Cmd, Frame, HEADER_SIZE};
 
+  // disable the ping
+  pub fn test_smux_config() -> SmuxConfig {
+    let mut config = SmuxConfig::default();
+    config.keep_alive_disable = true;
+    config
+  }
+
   #[tokio::test]
   async fn test_session_client() {
     let sid: Sid = 3;
     let (read_tx, read_rx) = mpsc::channel(1024);
     let (write_tx, mut write_rx) = mpsc::channel(1024);
     let conn = MockMpscStream { read_rx, write_tx };
-    let mut client = Session::new(conn, SmuxConfig::default(), true).unwrap();
+    let mut client = Session::new(conn, test_smux_config(), true).unwrap();
     let mut stream = client.open_stream().await.unwrap();
     assert_eq!(sid, stream.sid());
 
@@ -482,7 +500,7 @@ pub mod test {
     frame.with_data("hello!".as_bytes().to_vec());
     read_tx.send(frame.get_buf().unwrap()).await.unwrap();
 
-    let msg = stream.recv_message().await.unwrap();
+    let msg = stream.recv_message().await.unwrap().unwrap();
     assert_eq!(String::from_utf8_lossy(&msg).as_ref(), "hello!");
 
     // write some data
@@ -493,6 +511,7 @@ pub mod test {
 
     let data = write_rx.recv().await.unwrap();
     let frame = Frame::from_buf(&data).unwrap().unwrap();
+    let val: u8 = frame.cmd.into();
     assert!(matches!(frame.cmd, Cmd::Psh));
     let frame_data = &data[(HEADER_SIZE as usize)..HEADER_SIZE + (frame.length as usize)];
     assert_eq!(String::from_utf8_lossy(frame_data).as_ref(), "world!");
@@ -528,7 +547,7 @@ pub mod test {
     let (read_tx, read_rx) = mpsc::channel(1024);
     let (write_tx, mut write_rx) = mpsc::channel(1024);
     let conn = MockMpscStream { read_rx, write_tx };
-    let mut server = Session::new(conn, SmuxConfig::default(), false).unwrap();
+    let mut server = Session::new(conn, test_smux_config(), false).unwrap();
 
     let sid = 3;
     // send nop frame
@@ -569,7 +588,7 @@ pub mod test {
     let (_read_tx, read_rx) = mpsc::channel(1024);
     let (write_tx, write_rx) = mpsc::channel(1024);
     let conn = MockMpscStream { read_rx, write_tx };
-    let mut client = Session::new(conn, SmuxConfig::default(), true).unwrap();
+    let mut client = Session::new(conn, test_smux_config(), true).unwrap();
 
     // close the write channel to mock error
     drop(write_rx);

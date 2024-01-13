@@ -154,10 +154,8 @@ impl<T: AsyncRead + AsyncWrite + Send + Unpin + 'static> SessionInner<T> {
     }
 
     let finish_tx = req.finish_tx.take().unwrap();
-    let res = finish_tx.send(());
-    if res.is_err() {
-      // stream closed, ignore it
-    }
+    // ignore stream closed error
+    let _ = finish_tx.send(());
 
     Ok(())
   }

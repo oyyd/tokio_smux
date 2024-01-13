@@ -1,7 +1,4 @@
-use std::{
-  borrow::Borrow,
-  io::{Cursor, Read, Write},
-};
+use std::io::{Cursor, Write};
 
 use crate::error::{Result, TokioSmuxError};
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
