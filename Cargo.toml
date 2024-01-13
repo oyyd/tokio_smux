@@ -2,6 +2,13 @@
 name = "tokio_smux"
 version = "0.1.0"
 edition = "2021"
+authors = ["Yadong Ouyang <oyydoibh@gmail.com>"]
+description = "A kcp implementation for tokio"
+license = "MIT"
+readme = "README.md"
+keywords = ["smux", "tokio", "multiplexing", "muxing"]
+documentation = "https://docs.rs/tokio_smux"
+repository = "https://github.com/oyyd/tokio_smux"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 

@@ -262,7 +262,7 @@ mod test {
 
     // stop inner to check write data
     drop(write_tx);
-    let (inner, err) = join.await.unwrap();
+    let (inner, _err) = join.await.unwrap();
     assert_eq!(inner.conn.write_data.len(), HEADER_SIZE);
   }
 
@@ -273,7 +273,7 @@ mod test {
     stream.with_write_error(err_msg.clone());
 
     let (write_tx, write_rx) = mpsc::channel(1024);
-    let (recv_tx, recv_rx) = mpsc::channel(1024);
+    let (recv_tx, _recv_rx) = mpsc::channel(1024);
     let mut inner = SessionInner::new(stream, write_rx, recv_tx);
 
     let join = tokio::spawn(async move { inner.run().await });
@@ -298,7 +298,7 @@ mod test {
     let stream = MockAsyncStream::new();
 
     let (write_tx, write_rx) = mpsc::channel(1024);
-    let (recv_tx, recv_rx) = mpsc::channel(1024);
+    let (recv_tx, _recv_rx) = mpsc::channel(1024);
     let mut inner = SessionInner::new(stream, write_rx, recv_tx);
 
     let duration = std::time::Duration::from_millis(10);
@@ -317,7 +317,7 @@ mod test {
 
     drop(write_tx);
 
-    let (inner, res) = join.await.unwrap();
+    let (inner, _res) = join.await.unwrap();
     assert!(inner.conn.write_data.len() >= 8);
   }
 }

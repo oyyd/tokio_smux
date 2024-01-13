@@ -31,7 +31,6 @@ pub struct Session {
   inner_err: Arc<Mutex<Option<TokioSmuxError>>>,
 }
 
-// TODO don't show channel closed error
 impl Drop for Session {
   fn drop(&mut self) {
     // close all streams
