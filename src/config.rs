@@ -3,24 +3,26 @@ use core::time;
 use std::time::Duration;
 
 pub struct SmuxConfig {
-  // SMUX Protocol version, support 1,2
+  // SMUX Protocol version, support 1
   pub version: u8,
-  // Disabled keepalive
+  // Disable keepalive
   pub keep_alive_disable: bool,
-  // KeepAliveInterval is how often to send a NOP command to the remote
+  // keep_alive_interval is how often to send a NOP command to the remote
   pub keep_alive_interval: Duration,
+
+  // **NOTE:** Not yet supported.
   // KeepAliveTimeout is how long the session
   // will be closed if no data has arrived
   pub keep_alive_timeout: Duration,
-  // MaxFrameSize is used to control the maximum
-  // frame size to sent to the remote
-  pub max_frame_size: i32,
-  // MaxReceiveBuffer is used to control the maximum
-  // number of data in the buffer pool
-  pub max_receive_buffer: i32,
-  // MaxStreamBuffer is used to control the maximum
-  // number of data per stream
-  pub max_stream_buffer: i32,
+
+  // Max number of pending writing frames in queue.
+  // More writing frames operations will be blocked. Default: 4096.
+  pub writing_frame_channel_capacity: usize,
+
+  // Max number of pending reading frames in queue for each stream.
+  // More reading frames will be blocked until the frames in queue get consumed.
+  // Default: 1024
+  pub stream_reading_frame_channel_capacity: usize,
 }
 
 impl Default for SmuxConfig {
@@ -29,10 +31,9 @@ impl Default for SmuxConfig {
       version: 1,
       keep_alive_interval: time::Duration::from_secs(10),
       keep_alive_timeout: time::Duration::from_secs(30),
-      max_frame_size: 32768,
-      max_receive_buffer: 4194304,
-      max_stream_buffer: 65536,
       keep_alive_disable: false,
+      writing_frame_channel_capacity: 4096,
+      stream_reading_frame_channel_capacity: 1024,
     }
   }
 }
@@ -56,42 +57,6 @@ impl SmuxConfig {
           msg: "keep-alive timeout must be larger than keep-alive interval".to_string(),
         });
       }
-    }
-
-    if self.max_frame_size < 0 {
-      return Err(TokioSmuxError::InvalidConfig {
-        msg: "max frame size must be positive".to_string(),
-      });
-    }
-
-    if self.max_frame_size > 65535 {
-      return Err(TokioSmuxError::InvalidConfig {
-        msg: "max frame size must not be larger than 65535".to_string(),
-      });
-    }
-
-    if self.max_receive_buffer <= 0 {
-      return Err(TokioSmuxError::InvalidConfig {
-        msg: "max receive buffer must be positive".to_string(),
-      });
-    }
-
-    if self.max_stream_buffer <= 0 {
-      return Err(TokioSmuxError::InvalidConfig {
-        msg: "max stream buffer must be positive".to_string(),
-      });
-    }
-
-    if self.max_stream_buffer > self.max_receive_buffer {
-      return Err(TokioSmuxError::InvalidConfig {
-        msg: "max stream buffer must not be larger than max receive buffer".to_string(),
-      });
-    }
-
-    if self.max_stream_buffer > std::i32::MAX {
-      return Err(TokioSmuxError::InvalidConfig {
-        msg: "max stream buffer cannot be larger than 2147483647".to_string(),
-      });
     }
 
     Ok(())

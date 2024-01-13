@@ -136,7 +136,7 @@ impl Frame {
       length,
       cmd,
       sid,
-      data: None, // TODO when should we read data?
+      data: None,
     }))
   }
 

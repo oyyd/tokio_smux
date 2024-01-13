@@ -1,7 +1,7 @@
 use std::borrow::BorrowMut;
 use std::future;
 
-use crate::error::{Result, TokioSmuxError};
+use crate::error::Result;
 use crate::frame::HEADER_SIZE;
 use crate::{Cmd, Frame};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -59,12 +59,9 @@ impl<T: AsyncRead + AsyncWrite + Send + Unpin + 'static> SessionInner<T> {
     self.keep_alive_interval = Some(duration);
   }
 
-  pub async fn run(&mut self, error_tx: Option<oneshot::Sender<TokioSmuxError>>) {
-    let res = self.run_inner().await;
-    if res.is_err() {
-      let err = res.err().unwrap();
-      error_tx.map(|tx| tx.send(err));
-    }
+  pub async fn run(&mut self) -> Result<()> {
+    self.run_inner().await?;
+    Ok(())
   }
 
   async fn read_or_pending_if_finished(
@@ -100,8 +97,11 @@ impl<T: AsyncRead + AsyncWrite + Send + Unpin + 'static> SessionInner<T> {
       interval
     });
 
+    // REFACTOR Hot path.
+    // tokio::TcpStream has apis, like writable(), readable(), that
+    // should provide better performance when writing and readding concurrently.
+    // But they are not included in AsyncRead/AsyncWrite traits.
     // NOTE: Always ensure the cancelling safety.
-    // TODO hot path, is using select! correctly here?
     loop {
       let conn = self.conn.borrow_mut();
       let read_finished = self.read_finished;
@@ -146,7 +146,6 @@ impl<T: AsyncRead + AsyncWrite + Send + Unpin + 'static> SessionInner<T> {
   async fn handle_write_req(&mut self, mut req: WriteRequest) -> Result<()> {
     let data = req.frame.get_buf()?;
 
-    // TODO will using write() be different?
     self.conn.write_all(&data).await?;
 
     if req.finish_tx.is_none() {
@@ -181,7 +180,6 @@ impl<T: AsyncRead + AsyncWrite + Send + Unpin + 'static> SessionInner<T> {
       }
       let mut frame = frame.unwrap();
       let frame_length = frame.length;
-      // TODO add a test for this to ensure error pops
       // check if all data ready
       if (frame_length as u32 + HEADER_SIZE as u32) > (self.read_buf.len() as u32) {
         // not enough data
@@ -218,8 +216,8 @@ mod test {
   use crate::session_inner::SessionInner;
   use crate::session_inner::WriteRequest;
   use crate::{Cmd, Frame};
+  use tokio::sync::mpsc;
   use tokio::sync::oneshot;
-  use tokio::sync::{broadcast, mpsc};
 
   #[tokio::test]
   async fn test_session_inner() {
@@ -238,9 +236,9 @@ mod test {
     let mut inner = SessionInner::new(stream, write_rx, recv_tx);
 
     let join = tokio::spawn(async move {
-      inner.run(None).await;
+      let err = inner.run().await;
 
-      inner
+      (inner, err)
     });
 
     // test read and write
@@ -264,7 +262,7 @@ mod test {
 
     // stop inner to check write data
     drop(write_tx);
-    let inner = join.await.unwrap();
+    let (inner, err) = join.await.unwrap();
     assert_eq!(inner.conn.write_data.len(), HEADER_SIZE);
   }
 
@@ -276,14 +274,9 @@ mod test {
 
     let (write_tx, write_rx) = mpsc::channel(1024);
     let (recv_tx, recv_rx) = mpsc::channel(1024);
-    let (error_tx, error_rx) = oneshot::channel();
     let mut inner = SessionInner::new(stream, write_rx, recv_tx);
 
-    let join = tokio::spawn(async move {
-      inner.run(Some(error_tx)).await;
-
-      inner
-    });
+    let join = tokio::spawn(async move { inner.run().await });
 
     // write something and receive error
     let frame = Frame::new_v1(Cmd::Psh, 3);
@@ -295,9 +288,9 @@ mod test {
       .await;
     assert!(!res.is_err());
 
-    let err = error_rx.await.unwrap();
-    println!("err {}", err);
-    assert!(join.is_finished());
+    let res = join.await.unwrap();
+    assert!(res.is_err());
+    println!("err {}", res.err().unwrap().to_string());
   }
 
   #[tokio::test]
@@ -312,8 +305,8 @@ mod test {
     inner.with_keep_alive_interval(duration);
 
     let join = tokio::spawn(async move {
-      inner.run(None).await;
-      inner
+      let res = inner.run().await;
+      (inner, res)
     });
 
     // wait duration
@@ -324,7 +317,7 @@ mod test {
 
     drop(write_tx);
 
-    let inner = join.await.unwrap();
+    let (inner, res) = join.await.unwrap();
     assert!(inner.conn.write_data.len() >= 8);
   }
 }

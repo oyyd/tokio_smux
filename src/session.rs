@@ -7,12 +7,10 @@ use crate::stream::Stream;
 use dashmap::DashMap;
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, Mutex};
 
-// TODO move to config
-const MAX_STREAMS: usize = 65535;
-const MAX_WRITE_REQ: usize = 1024;
-const MAX_READ_REQ: usize = 1024;
+const MAX_READ_REQ: usize = 4096;
+const MAX_IN_QUEUE_SYNC_FRAMES: usize = 4096;
 
 pub struct Session {
   config: SmuxConfig,
@@ -30,11 +28,7 @@ pub struct Session {
   sid_close_tx_map: Arc<DashMap<Sid, oneshot::Sender<()>>>,
   sid_drop_tx: mpsc::Sender<Sid>,
 
-  inner_err: Option<TokioSmuxError>,
-  inner_err_rx: oneshot::Receiver<TokioSmuxError>,
-
-  // TODO move to config
-  channel_buffer: usize,
+  inner_err: Arc<Mutex<Option<TokioSmuxError>>>,
 }
 
 // TODO don't show channel closed error
@@ -77,20 +71,26 @@ impl Session {
     config.verify_config()?;
 
     // init SessionInner
-    let (write_tx, write_rx) = mpsc::channel(MAX_WRITE_REQ);
+    let (write_tx, write_rx) = mpsc::channel(config.writing_frame_channel_capacity);
     let (read_tx, new_frame_rx) = mpsc::channel(MAX_READ_REQ);
+    let inner_err = Arc::new(Mutex::new(None));
     let mut inner = SessionInner::new(conn, write_rx, read_tx);
     if !config.keep_alive_disable {
       inner.with_keep_alive_interval(config.keep_alive_interval)
     }
-    let (inner_err_tx, inner_err_rx) = oneshot::channel();
+
+    let inner_err_handle = inner_err.clone();
+
     tokio::spawn(async move {
-      inner.run(Some(inner_err_tx)).await;
+      let res = inner.run().await;
+      if res.is_err() {
+        let mut inner_err = inner_err_handle.lock().await;
+        let _ = inner_err.insert(res.err().unwrap());
+      }
     });
 
     // init ReadFrameGrouper
-    let channel_buffer = 1024;
-    let (sync_tx, sync_rx) = mpsc::channel(channel_buffer);
+    let (sync_tx, sync_rx) = mpsc::channel(MAX_IN_QUEUE_SYNC_FRAMES);
     let sid_tx_map = Arc::new(DashMap::new());
     let sid_rx_map = Arc::new(DashMap::new());
     let mut spliter = ReadFrameGrouper {
@@ -98,14 +98,14 @@ impl Session {
       sync_tx,
       sid_tx_map: sid_tx_map.clone(),
       sid_rx_map: sid_rx_map.clone(),
-      sid_frame_buffer_size: channel_buffer,
+      sid_frame_buffer_size: config.stream_reading_frame_channel_capacity,
     };
     tokio::spawn(async move {
       spliter.run().await;
     });
 
     // init self
-    let (sid_drop_tx, sid_drop_rx) = mpsc::channel(MAX_STREAMS);
+    let (sid_drop_tx, sid_drop_rx) = mpsc::channel(1024);
 
     let session = Self {
       config,
@@ -123,10 +123,7 @@ impl Session {
       sid_drop_tx,
 
       sync_rx,
-      inner_err: None,
-      inner_err_rx,
-
-      channel_buffer,
+      inner_err,
     };
 
     let mut cleaner = SessionCleaner::from_session(&session, sid_drop_rx);
@@ -139,21 +136,17 @@ impl Session {
     (self.sid_close_tx_map.len() + self.sid_tx_map.len() + self.sid_rx_map.len()) as i32
   }
 
-  pub fn get_inner_err(&mut self) -> Option<TokioSmuxError> {
-    if self.inner_err.is_some() {
-      return self.inner_err.clone();
+  pub async fn get_inner_err(&mut self) -> Option<TokioSmuxError> {
+    let inner_err = self.inner_err.lock().await;
+    if inner_err.is_some() {
+      return inner_err.clone();
     }
 
-    let res = self.inner_err_rx.try_recv();
-    if res.is_ok() {
-      self.inner_err = Some(res.unwrap());
-    }
-
-    return self.inner_err.clone();
+    return None;
   }
 
-  fn inner_ok(&mut self) -> Result<()> {
-    let err = self.get_inner_err();
+  async fn inner_ok(&mut self) -> Result<()> {
+    let err = self.get_inner_err().await;
     if err.is_none() {
       return Ok(());
     }
@@ -167,7 +160,7 @@ impl Session {
     }
 
     // Check inner error.
-    self.inner_ok()?;
+    self.inner_ok().await?;
 
     self.sid += 2;
     if self.sid == self.sid % 2 {
@@ -178,12 +171,20 @@ impl Session {
 
     // New stream and write sync cmd.
     let frame = Frame::new(self.config.version, Cmd::Sync, sid);
-    self.write_frame(frame).await?;
+    let res = self.write_frame(frame).await;
+    // When the operation fails, firstly check and return the inner error because
+    // we want to expose the inner error to users, which is more useful than
+    // "session closed".
+    if res.is_err() {
+      self.inner_ok().await?;
+      // If no inner error, return the write_frame error.
+      res?;
+    }
 
     // Update sid_tx_map and sid_rx_map when open_stream.
     {
       if !self.sid_tx_map.contains_key(&sid) {
-        let (tx, rx) = mpsc::channel(self.channel_buffer);
+        let (tx, rx) = mpsc::channel(self.config.stream_reading_frame_channel_capacity);
         self.sid_tx_map.insert(sid, tx);
         self.sid_rx_map.insert(sid, rx);
       }
@@ -199,7 +200,7 @@ impl Session {
 
   pub async fn accept_stream(&mut self) -> Result<Stream> {
     // Check inner error.
-    self.inner_ok()?;
+    self.inner_ok().await?;
 
     let frame = self.sync_rx.recv().await;
     if frame.is_none() {
@@ -598,6 +599,7 @@ pub mod test {
     // write some data to pretend inner write operation
     let stream = client.open_stream().await;
     assert!(stream.is_err());
+    assert_eq!(stream.err().unwrap().to_string(), "mock error");
 
     // expect inner error
     let stream = client.open_stream().await;
@@ -608,6 +610,6 @@ pub mod test {
     assert!(stream.is_err());
     assert_eq!(stream.err().unwrap().to_string(), "mock error");
 
-    assert!(client.get_inner_err().is_some());
+    assert!(client.get_inner_err().await.is_some());
   }
 }
