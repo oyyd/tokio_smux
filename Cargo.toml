@@ -1,9 +1,9 @@
 [package]
 name = "tokio_smux"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 authors = ["Yadong Ouyang <oyydoibh@gmail.com>"]
-description = "Smux protocol implementation in Rust, whichi provides stream multiplexing for reliable streams."
+description = "Smux protocol in Rust. Provide multiplexing for reliable streams."
 license = "MIT"
 readme = "README.md"
 keywords = ["smux", "tokio", "multiplexing", "muxing"]
