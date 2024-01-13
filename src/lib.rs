@@ -1,5 +1,3 @@
-//!
-
 mod config;
 mod error;
 mod frame;
@@ -8,8 +6,8 @@ mod session;
 mod session_inner;
 mod stream;
 
+pub use frame::Cmd;
 pub use config::SmuxConfig;
 pub use error::TokioSmuxError;
-pub use frame::{Cmd, Frame};
-pub use session::Session;
 pub use stream::Stream;
+pub use session::Session;

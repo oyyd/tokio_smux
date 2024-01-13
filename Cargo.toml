@@ -25,3 +25,14 @@ tokio = { version = "1.35", features = [
 ] }
 dashmap = "5.5"
 log = "0.4"
+
+
+[[example]]
+name = "client"
+
+[[example]]
+name = "server"
+
+
+[dev-dependencies]
+tokio = { version = "1.35", features = ["rt-multi-thread"] }

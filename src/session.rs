@@ -12,6 +12,7 @@ use tokio::sync::{mpsc, oneshot, Mutex};
 const MAX_READ_REQ: usize = 4096;
 const MAX_IN_QUEUE_SYNC_FRAMES: usize = 4096;
 
+/// Session is used to manage the underlying stream and provide multiplexing abilites.
 pub struct Session {
   config: SmuxConfig,
 
@@ -48,14 +49,14 @@ impl Drop for Session {
 }
 
 impl Session {
-  pub fn new_client<T: AsyncRead + AsyncWrite + Send + Unpin + 'static>(
+  pub fn client<T: AsyncRead + AsyncWrite + Send + Unpin + 'static>(
     conn: T,
     config: SmuxConfig,
   ) -> Result<Self> {
     return Session::new(conn, config, true);
   }
 
-  pub fn new_server<T: AsyncRead + AsyncWrite + Send + Unpin + 'static>(
+  pub fn server<T: AsyncRead + AsyncWrite + Send + Unpin + 'static>(
     conn: T,
     config: SmuxConfig,
   ) -> Result<Self> {
@@ -131,10 +132,7 @@ impl Session {
     Ok(session)
   }
 
-  pub fn inner_keys(&self) -> i32 {
-    (self.sid_close_tx_map.len() + self.sid_tx_map.len() + self.sid_rx_map.len()) as i32
-  }
-
+  /// Get the underlying stream error, e.g. tcp connection failures.
   pub async fn get_inner_err(&mut self) -> Option<TokioSmuxError> {
     let inner_err = self.inner_err.lock().await;
     if inner_err.is_some() {
@@ -152,6 +150,7 @@ impl Session {
     return Err(err.unwrap());
   }
 
+  /// Create a new `Stream` by sending a sync frame to the remote.
   pub async fn open_stream(&mut self) -> Result<Stream> {
     // Check if stream id overflows.
     if self.go_away {
@@ -197,6 +196,7 @@ impl Session {
     Ok(stream.unwrap())
   }
 
+  /// Create a new `Stream` by receiving a sync frame from the remote.
   pub async fn accept_stream(&mut self) -> Result<Stream> {
     // Check inner error.
     self.inner_ok().await?;

@@ -3,10 +3,9 @@ use crate::frame::{Cmd, Frame, Sid};
 use crate::session_inner::WriteRequest;
 use tokio::sync::{mpsc, oneshot};
 
-// Three possible closing scenarioes:
-// 1. close by remote fin message (should not send fin to remote)
-// 2. close by session (should send fin to remote)
-// 3. close by stream (should send fin to remote)
+/// Use `Stream` to read data or write data from the remote.
+///
+/// `Stream` is created by calling `Session::open_stream()` or `Session::accept_stream()`.
 pub struct Stream {
   sid: Sid,
 
@@ -21,6 +20,10 @@ pub struct Stream {
   closed: bool,
 }
 
+// Three possible closing scenarioes:
+// 1. close by remote fin message (should not send fin to remote)
+// 2. close by session (should send fin to remote)
+// 3. close by stream (should send fin to remote)
 impl Drop for Stream {
   fn drop(&mut self) {
     let sid = self.sid;
@@ -69,6 +72,7 @@ impl Stream {
     }
   }
 
+  // Get stream id.
   pub fn sid(&self) -> Sid {
     self.sid
   }
@@ -77,6 +81,10 @@ impl Stream {
     self.drop_tx = drop_tx;
   }
 
+  /// Send a data frame to the remote.
+  ///
+  /// Since the max data size of a frame is `u16::MAX`, the `data.len()` should be smaller or equal to
+  /// `u16::MAX`, or an error will be returned.
   pub async fn send_message(&mut self, data: Vec<u8>) -> Result<()> {
     if data.len() > (u16::MAX as usize) {
       return Err(TokioSmuxError::StreamWriteTooLargeData);
@@ -107,6 +115,9 @@ impl Stream {
     Ok(())
   }
 
+  /// Receive a data frame from the remote.
+  ///
+  /// Returning `Ok(None)` means the stream has received fin and gets closed by the remote.
   pub async fn recv_message(&mut self) -> Result<Option<Vec<u8>>> {
     // We don't check close_rx here because we still allow the stream to consume
     // rest data.

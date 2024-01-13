@@ -5,18 +5,19 @@ use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 
 pub type Sid = u32;
 
+/// Frame commands of smux protocal.
 #[derive(Clone, Copy)]
 pub enum Cmd {
-  // stream open
+  /// Stream open.
   Sync,
-  // stream close, a.k.a EOF mark
+  /// Stream close, a.k.a EOF mark.
   Fin,
-  // data push
+  /// Data push.
   Psh,
-  // no operation
+  /// No operation.
   Nop,
-  // protocol version 2 extra commands
-  // notify bytes consumed by remote peer-end
+  /// Protocol version 2 extra commands.
+  /// Notify bytes consumed by remote peer-end.
   Udp,
 }
 
@@ -140,6 +141,7 @@ impl Frame {
     }))
   }
 
+  #[allow(dead_code)]
   pub fn from_buf_with_data(data: &[u8]) -> Result<Option<Self>> {
     let frame = Frame::from_buf(data);
     if frame.is_err() {

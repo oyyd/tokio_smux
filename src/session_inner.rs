@@ -3,7 +3,7 @@ use std::future;
 
 use crate::error::Result;
 use crate::frame::HEADER_SIZE;
-use crate::{Cmd, Frame};
+use crate::frame::{Cmd, Frame};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot};
 use tokio::time;
@@ -212,10 +212,10 @@ impl<T: AsyncRead + AsyncWrite + Send + Unpin + 'static> SessionInner<T> {
 #[cfg(test)]
 mod test {
   use crate::frame::HEADER_SIZE;
+  use crate::frame::{Cmd, Frame};
   use crate::session::test::MockAsyncStream;
   use crate::session_inner::SessionInner;
   use crate::session_inner::WriteRequest;
-  use crate::{Cmd, Frame};
   use tokio::sync::mpsc;
   use tokio::sync::oneshot;
 
