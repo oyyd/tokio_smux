@@ -6,7 +6,7 @@ use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 pub type Sid = u32;
 
 /// Frame commands of smux protocal.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub enum Cmd {
   /// Stream open.
   Sync,
@@ -64,6 +64,16 @@ pub struct Frame {
   pub sid: Sid,
   // Extra data, whos length should equal to length.
   pub data: Option<Vec<u8>>,
+}
+
+impl std::fmt::Debug for Frame {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    f.debug_struct("Frame")
+      .field("sid", &self.sid)
+      .field("cmd", &self.cmd)
+      .field("len", &self.length)
+      .finish()
+  }
 }
 
 impl Frame {

@@ -1,8 +1,8 @@
 use crate::frame::{Cmd, Frame, Sid};
 use crate::session_inner::ReadRequest;
-use dashmap::DashMap;
+use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Mutex};
 
 // Consume reading frames and split them into:
 // - Sync frames
@@ -18,11 +18,11 @@ pub(crate) struct ReadFrameGrouper {
   pub sync_tx: mpsc::Sender<Frame>,
 
   // Session could also operate `sid_tx_map` and `sid_rx_map`.
-  pub sid_tx_map: Arc<DashMap<Sid, mpsc::Sender<Frame>>>,
+  pub sid_tx_map: Arc<Mutex<HashMap<Sid, Arc<Mutex<mpsc::Sender<Frame>>>>>>,
 
   // `sid_rx_map` is shared with session.
   // Items of `sid_rx_map` will be taken away by the session when accepting new streams.
-  pub sid_rx_map: Arc<DashMap<Sid, mpsc::Receiver<Frame>>>,
+  pub sid_rx_map: Arc<Mutex<HashMap<Sid, mpsc::Receiver<Frame>>>>,
 
   pub sid_frame_buffer_size: usize,
 }
@@ -57,11 +57,18 @@ impl ReadFrameGrouper {
 
   async fn handle_sync(&mut self, read_req: ReadRequest) {
     let sid = read_req.frame.sid;
-    if !self.sid_tx_map.contains_key(&sid) {
-      let (tx, rx) = mpsc::channel(self.sid_frame_buffer_size);
-      self.sid_tx_map.insert(sid, tx);
-      self.sid_rx_map.insert(sid, rx);
-    }
+    {
+      let contained = { self.sid_tx_map.lock().await.contains_key(&sid) };
+      if !contained {
+        let (tx, rx) = mpsc::channel(self.sid_frame_buffer_size);
+        self
+          .sid_tx_map
+          .lock()
+          .await
+          .insert(sid, Arc::new(Mutex::new(tx)));
+        self.sid_rx_map.lock().await.insert(sid, rx);
+      }
+    };
     let send_sync_tx_res = self.sync_tx.send(read_req.frame).await;
     if send_sync_tx_res.is_err() {
       // session closed
@@ -71,13 +78,18 @@ impl ReadFrameGrouper {
 
   async fn handle_fin_push(&mut self, read_req: ReadRequest) {
     let sid = read_req.frame.sid;
-    if !self.sid_tx_map.contains_key(&sid) {
+    let contained = { self.sid_tx_map.lock().await.contains_key(&sid) };
+    if !contained {
       // unexpected, ignore the frame
       log::warn!("[grouper] receive unexecpted frame, sid: {}", sid,);
       return;
     }
-    let tx = self.sid_tx_map.get(&sid).unwrap();
-    let _ = tx.send(read_req.frame).await;
+    let tx = {
+      let lock = self.sid_tx_map.lock().await;
+      let tx = lock.get(&sid).unwrap();
+      tx.clone()
+    };
+    let _ = tx.lock().await.send(read_req.frame).await;
   }
 }
 
@@ -86,21 +98,22 @@ mod test {
   use crate::frame::{Cmd, Frame};
   use crate::read_frame_grouper::ReadFrameGrouper;
   use crate::session_inner::ReadRequest;
-  use dashmap::DashMap;
+  use std::collections::HashMap;
   use std::sync::Arc;
-  use tokio::sync::mpsc;
+  use tokio::sync::{mpsc, Mutex};
 
   #[tokio::test]
   async fn test_grouper() {
     let (new_frame_tx, new_frame_rx) = mpsc::channel(1024);
     let (sync_tx, mut sync_rx) = mpsc::channel(1024);
-    let sid_rx_map = Arc::new(DashMap::new());
+    let sid_rx_map = HashMap::new();
+    let sid_rx_map = Arc::new(Mutex::new(sid_rx_map));
     let mut grouper = ReadFrameGrouper {
       new_frame_rx,
       sid_frame_buffer_size: 1024,
       sync_tx,
       sid_rx_map: sid_rx_map.clone(),
-      sid_tx_map: Arc::new(DashMap::new()),
+      sid_tx_map: Arc::new(Mutex::new(HashMap::new())),
     };
 
     // Should create correspond sid_tx_map when receive sync frames.
@@ -121,10 +134,9 @@ mod test {
 
     let frame = sync_rx.recv().await.unwrap();
     assert!(matches!(frame.cmd, Cmd::Sync));
-    let item = sid_rx_map.remove(&sid);
+    let item = { sid_rx_map.lock().await.remove(&sid) };
     assert!(item.is_some());
-    let (id, mut item_frame_rx) = item.unwrap();
-    assert_eq!(id, sid);
+    let mut item_frame_rx = item.unwrap();
     let frame = item_frame_rx.recv().await.unwrap();
     assert_eq!(frame.sid, sid);
 
@@ -141,7 +153,7 @@ mod test {
     frame.with_data(vec![0; 10]);
     new_frame_tx.send(ReadRequest { frame }).await.unwrap();
     item_frame_rx.recv().await.unwrap();
-    assert!(sid_rx_map.remove(&sid).is_none());
+    assert!(sid_rx_map.lock().await.remove(&sid).is_none());
 
     // Cloud new_frame_rx should
     drop(new_frame_tx);
