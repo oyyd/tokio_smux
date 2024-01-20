@@ -4,6 +4,7 @@ use std::future;
 use crate::error::Result;
 use crate::frame::HEADER_SIZE;
 use crate::frame::{Cmd, Frame};
+use log;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot};
 use tokio::time;
@@ -115,7 +116,7 @@ impl<T: AsyncRead + AsyncWrite + Send + Unpin + 'static> SessionInner<T> {
             self.read_finished = true;
             continue;
           }
-          self.handle_read_data(&data[0..size])?;
+          self.handle_read_data(&data[0..size]).await?;
         }
         // write
         req = self.write_rx.recv() => {
@@ -152,6 +153,8 @@ impl<T: AsyncRead + AsyncWrite + Send + Unpin + 'static> SessionInner<T> {
       return Ok(());
     }
 
+    log::trace!("send frame: {:?}", req.frame);
+
     let finish_tx = req.finish_tx.take().unwrap();
     // ignore stream closed error
     let _ = finish_tx.send(());
@@ -159,7 +162,7 @@ impl<T: AsyncRead + AsyncWrite + Send + Unpin + 'static> SessionInner<T> {
     Ok(())
   }
 
-  fn handle_read_data(&mut self, data: &[u8]) -> Result<()> {
+  async fn handle_read_data(&mut self, data: &[u8]) -> Result<()> {
     if data.len() == 0 {
       // Remote write side closed, no more data.
       return Ok(());
@@ -179,6 +182,9 @@ impl<T: AsyncRead + AsyncWrite + Send + Unpin + 'static> SessionInner<T> {
         break;
       }
       let mut frame = frame.unwrap();
+
+      log::trace!("receive frame: {:?}", frame);
+
       let frame_length = frame.length;
       // check if all data ready
       if (frame_length as u32 + HEADER_SIZE as u32) > (self.read_buf.len() as u32) {
@@ -196,11 +202,7 @@ impl<T: AsyncRead + AsyncWrite + Send + Unpin + 'static> SessionInner<T> {
 
       // output frame
       let recv_tx = self.recv_tx.clone();
-      tokio::spawn(async move {
-        // Will block if the tx capability is empty.
-        // is_err() means the session is closed, therefore ignore the error.
-        let _ = recv_tx.send(read_req).await;
-      });
+      let _ = recv_tx.send(read_req).await;
 
       // continue
     }

@@ -4,7 +4,7 @@ use crate::frame::{Cmd, Frame, Sid};
 use crate::read_frame_grouper::ReadFrameGrouper;
 use crate::session_inner::{SessionInner, WriteRequest};
 use crate::stream::Stream;
-use dashmap::DashMap;
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{mpsc, oneshot, Mutex};
@@ -24,9 +24,9 @@ pub struct Session {
   go_away: bool,
 
   sync_rx: mpsc::Receiver<Frame>,
-  sid_tx_map: Arc<DashMap<Sid, mpsc::Sender<Frame>>>,
-  sid_rx_map: Arc<DashMap<Sid, mpsc::Receiver<Frame>>>,
-  sid_close_tx_map: Arc<DashMap<Sid, oneshot::Sender<()>>>,
+  sid_tx_map: Arc<Mutex<HashMap<Sid, Arc<Mutex<mpsc::Sender<Frame>>>>>>,
+  sid_rx_map: Arc<Mutex<HashMap<Sid, mpsc::Receiver<Frame>>>>,
+  sid_close_tx_map: Arc<Mutex<HashMap<Sid, oneshot::Sender<()>>>>,
   sid_drop_tx: mpsc::Sender<Sid>,
 
   inner_err: Arc<Mutex<Option<TokioSmuxError>>>,
@@ -35,16 +35,18 @@ pub struct Session {
 impl Drop for Session {
   fn drop(&mut self) {
     // close all streams
-    let mut keys: Vec<Sid> = vec![];
-    for kv in self.sid_close_tx_map.iter() {
-      let sid = kv.key();
-      keys.push(*sid);
-    }
-    for id in keys {
-      let item = self.sid_close_tx_map.remove(&id);
-      let (_, tx) = item.unwrap();
-      let _ = tx.send(());
-    }
+    let sid_close_tx_map = self.sid_close_tx_map.clone();
+    tokio::spawn(async move {
+      let mut keys: Vec<Sid> = vec![];
+      for (kv, _) in sid_close_tx_map.lock().await.iter() {
+        keys.push(*kv);
+      }
+      for id in keys {
+        let item = sid_close_tx_map.lock().await.remove(&id);
+        let tx = item.unwrap();
+        let _ = tx.send(());
+      }
+    });
   }
 }
 
@@ -91,8 +93,8 @@ impl Session {
 
     // init ReadFrameGrouper
     let (sync_tx, sync_rx) = mpsc::channel(MAX_IN_QUEUE_SYNC_FRAMES);
-    let sid_tx_map = Arc::new(DashMap::new());
-    let sid_rx_map = Arc::new(DashMap::new());
+    let sid_tx_map = Arc::new(Mutex::new(HashMap::new()));
+    let sid_rx_map = Arc::new(Mutex::new(HashMap::new()));
     let mut spliter = ReadFrameGrouper {
       new_frame_rx,
       sync_tx,
@@ -119,7 +121,7 @@ impl Session {
 
       sid_tx_map,
       sid_rx_map,
-      sid_close_tx_map: Arc::new(DashMap::new()),
+      sid_close_tx_map: Arc::new(Mutex::new(HashMap::new())),
       sid_drop_tx,
 
       sync_rx,
@@ -181,17 +183,22 @@ impl Session {
 
     // Update sid_tx_map and sid_rx_map when open_stream.
     {
-      if !self.sid_tx_map.contains_key(&sid) {
+      let contained = { self.sid_tx_map.lock().await.contains_key(&sid) };
+      if !contained {
         let (tx, rx) = mpsc::channel(self.config.stream_reading_frame_channel_capacity);
-        self.sid_tx_map.insert(sid, tx);
-        self.sid_rx_map.insert(sid, rx);
+        self
+          .sid_tx_map
+          .lock()
+          .await
+          .insert(sid, Arc::new(Mutex::new(tx)));
+        self.sid_rx_map.lock().await.insert(sid, rx);
       }
     }
-    let stream = self.new_stream(sid);
+    let stream = self.new_stream(sid).await;
     if stream.is_err() {
       // not likely
-      self.sid_tx_map.remove(&sid);
-      self.sid_rx_map.remove(&sid);
+      self.sid_tx_map.lock().await.remove(&sid);
+      self.sid_rx_map.lock().await.remove(&sid);
     }
     Ok(stream.unwrap())
   }
@@ -209,25 +216,24 @@ impl Session {
     let frame = frame.unwrap();
     let sid = frame.sid;
 
-    let stream = self.new_stream(sid)?;
+    let stream = self.new_stream(sid).await?;
 
     Ok(stream)
   }
 
-  fn new_stream(&mut self, sid: Sid) -> Result<Stream> {
+  async fn new_stream(&mut self, sid: Sid) -> Result<Stream> {
     let frame_rx = {
-      let rx = self.sid_rx_map.remove(&sid);
+      let rx = self.sid_rx_map.lock().await.remove(&sid);
       if rx.is_none() {
         return Err(TokioSmuxError::Default {
           msg: "unexpected empty sid in sid_rx_map".to_string(),
         });
       }
-      let (_id, rx) = rx.unwrap();
-      rx
+      rx.unwrap()
     };
 
     let (close_tx, close_rx) = oneshot::channel();
-    self.sid_close_tx_map.insert(sid, close_tx);
+    self.sid_close_tx_map.lock().await.insert(sid, close_tx);
 
     let mut stream = Stream::new(sid, frame_rx, self.write_tx.clone(), close_rx);
     stream.with_drop_tx(Some(self.sid_drop_tx.clone()));
@@ -255,9 +261,9 @@ impl Session {
 struct SessionCleaner {
   sid_drop_rx: mpsc::Receiver<Sid>,
 
-  sid_tx_map: Arc<DashMap<Sid, mpsc::Sender<Frame>>>,
-  sid_rx_map: Arc<DashMap<Sid, mpsc::Receiver<Frame>>>,
-  sid_close_tx_map: Arc<DashMap<Sid, oneshot::Sender<()>>>,
+  sid_tx_map: Arc<Mutex<HashMap<Sid, Arc<Mutex<mpsc::Sender<Frame>>>>>>,
+  sid_rx_map: Arc<Mutex<HashMap<Sid, mpsc::Receiver<Frame>>>>,
+  sid_close_tx_map: Arc<Mutex<HashMap<Sid, oneshot::Sender<()>>>>,
 }
 
 impl SessionCleaner {
@@ -278,9 +284,9 @@ impl SessionCleaner {
       }
 
       let sid = sid.unwrap();
-      self.sid_tx_map.remove(&sid);
-      self.sid_rx_map.remove(&sid);
-      self.sid_close_tx_map.remove(&sid);
+      self.sid_tx_map.lock().await.remove(&sid);
+      self.sid_rx_map.lock().await.remove(&sid);
+      self.sid_close_tx_map.lock().await.remove(&sid);
     }
   }
 }
@@ -531,9 +537,9 @@ pub mod test {
 
     // clean up after a while
     tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    assert!(client.sid_tx_map.get(&sid).is_none());
-    assert!(client.sid_rx_map.get(&sid).is_none());
-    assert!(client.sid_close_tx_map.get(&sid).is_none());
+    assert!(client.sid_tx_map.lock().await.get(&sid).is_none());
+    assert!(client.sid_rx_map.lock().await.get(&sid).is_none());
+    assert!(client.sid_close_tx_map.lock().await.get(&sid).is_none());
 
     // the remote should also receive the fin
     let data = write_rx.recv().await.unwrap();

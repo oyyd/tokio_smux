@@ -126,7 +126,7 @@ impl Stream {
     }
 
     // And outside sessions should also close the frame_rx.
-    let msg = self.frame_rx.recv().await;
+    let msg: Option<Frame> = self.frame_rx.recv().await;
     if msg.is_none() {
       // session closed
       return Err(TokioSmuxError::StreamClosed);
