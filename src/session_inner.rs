@@ -138,6 +138,7 @@ impl<T: AsyncRead + AsyncWrite + Send + Unpin + 'static> SessionInner<T> {
 
   async fn handle_keep_alive_interval_tick(&mut self) -> Result<()> {
     let frame = Frame::new_v1(Cmd::Nop, 0);
+    log::trace!("send frame: {:?}", frame);
     let buf = frame.get_buf()?;
     self.conn.write_all(&buf).await?;
 
